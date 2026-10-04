@@ -1,4 +1,0 @@
-systemd-networkd.service
-systemd-resolved.service
-systemd-timesyncd.service
-iwd.service

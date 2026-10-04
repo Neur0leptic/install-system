@@ -1,3 +1,0 @@
-# Needed when adopting an existing system that has not built AUR packages yet.
-base-devel
-git

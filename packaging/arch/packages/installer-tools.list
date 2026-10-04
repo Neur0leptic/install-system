@@ -1,7 +1,0 @@
-# Shared installer/Chezmoi prerequisites for new and adopted systems.
-git
-curl
-openssh
-gnupg
-python
-jq

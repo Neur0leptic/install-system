@@ -29,7 +29,8 @@ Torrent tools are optional and selected separately.
 
 ## Usage
 
-Clone the repository and keep the script and packaging directories together:
+Clone the repository and keep the script and shared helpers together.
+Gentoo and Arch package inputs are fetched automatically from their repositories:
 
 ```sh
 git clone https://github.com/Neur0leptic/install-system.git
@@ -86,4 +87,5 @@ Display and input preferences are collected interactively and saved for reuse.
 ## Related repositories
 
 - [Gentoo packages and policy](https://github.com/Neur0leptic/neurogentoo)
+- [Arch packages and policy](https://github.com/Neur0leptic/neuroarch)
 - [Chezmoi dotfiles](https://github.com/Neur0leptic/dotfiles)

@@ -1,6 +1,0 @@
-# Subvolume and mountpoint. Keep /boot and /var/lib/pacman inside @ for rollback.
-@ /
-@home /home
-@snapshots /.snapshots
-@log /var/log
-@pkg /var/cache/pacman/pkg

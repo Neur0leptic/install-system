@@ -9,9 +9,12 @@ umask 077
 readonly PROGRAM="install-system"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 readonly SCRIPT_PATH
-ARCH_DATA="$(dirname "$SCRIPT_PATH")/packaging/arch"
-[[ -d "$ARCH_DATA" ]] || ARCH_DATA=/usr/local/share/install-system/arch
-readonly ARCH_DATA
+ARCH_DATA=""
+ARCH_POLICY_REF=""
+ARCH_LEGACY_STATE=0
+readonly NEUROARCH_URL="https://github.com/Neur0leptic/neuroarch.git"
+readonly NEUROARCH_BRANCH="main"
+readonly NEUROARCH_CACHE="/usr/local/share/install-system/.neuroarch-snapshots"
 COMMON_DATA="$(dirname "$SCRIPT_PATH")/packaging/common"
 [[ -d "$COMMON_DATA" ]] || COMMON_DATA=/usr/local/share/install-system/common
 readonly COMMON_DATA
@@ -281,7 +284,7 @@ root_lock_file_is_safe() {
 }
 
 valid_state_key() {
-    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|username|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full)|stage\.[a-z0-9-]+)$ ]]
+    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full)|stage\.[a-z0-9-]+)$ ]]
 }
 
 valid_state_value() {
@@ -295,6 +298,7 @@ validate_loaded_state() {
         arch_validate_state
     else
         [[ "${STATE[tier]}" =~ ^(minimal|dwl|full)$ ]] || die "invalid Gentoo tier in state"
+        [[ ! -v STATE[arch_policy_ref] ]] || die "Gentoo state contains an Arch policy revision"
     fi
     [[ ! -v STATE[policy_ref] || "${STATE[policy_ref]}" =~ ^[0-9a-f]{40}$ ]] || die "invalid policy revision in state"
     [[ ! -v STATE[compiler_policy] || "${STATE[compiler_policy]}" =~ ^(bootstrap|prepolly|gcc|clang|polly|final)$ ]] || die "invalid compiler transition in state"
@@ -407,7 +411,18 @@ state_load() {
 
     configure_sequences "${STATE[distribution]:-gentoo}"
     validate_loaded_state
-    [[ ! -v STATE[policy_ref] ]] || select_portage_snapshot "${STATE[policy_ref]}"
+    ARCH_LEGACY_STATE=0
+    if [[ "${STATE[distribution]:-gentoo}" == arch ]]; then
+        if [[ -v STATE[arch_policy_ref] ]]; then
+            select_arch_snapshot "${STATE[arch_policy_ref]}"
+        else
+            ARCH_POLICY_REF=""
+            ARCH_DATA=""
+            ARCH_LEGACY_STATE=1
+        fi
+    else
+        [[ ! -v STATE[policy_ref] ]] || select_portage_snapshot "${STATE[policy_ref]}"
+    fi
 }
 
 state_set() {
@@ -453,6 +468,11 @@ state_initialize() {
     if [[ "$MODE" == "existing" ]]; then
         [[ -s /etc/machine-id ]] || die "existing mode requires /etc/machine-id"
         STATE[system_id]="$(tr -d '\r\n' </etc/machine-id)"
+    fi
+    if [[ "$DISTRIBUTION" == arch && $DRY_RUN -eq 0 ]]; then
+        ARCH_LEGACY_STATE=0
+        ensure_arch_source no
+        STATE[arch_policy_ref]="$ARCH_POLICY_REF"
     fi
     [[ "$write_now" == "no" ]] || state_write
 }
@@ -1076,7 +1096,7 @@ show_status() {
     fi
     state_load
     printf 'State file: %s\n' "$STATE_FILE"
-    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full; do
+    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full; do
         [[ -n "${STATE[$key]:-}" ]] && printf '%-18s %s\n' "$key:" "${STATE[$key]}"
     done
     printf 'Stages:\n'
@@ -4333,6 +4353,7 @@ arch_select_install_options() {
 
 arch_validate_state() {
     [[ "${STATE[tier]}" =~ ^(minimal|desktop|full)$ ]] || die "invalid Arch tier"
+    [[ ! -v STATE[arch_policy_ref] ]] || arch_policy_revision_is_valid "${STATE[arch_policy_ref]}" || die "invalid saved Arch policy revision"
     [[ "${STATE[desktop]:-}" =~ ^(none|dwl|hyprland)$ ]] || die "invalid saved desktop"
     if [[ "${STATE[mode]}" == existing ]]; then
         [[ "${STATE[filesystem]:-}" == existing && "${STATE[boot_method]:-}" == existing ]] || die "existing state must retain its boot/filesystem setup"
@@ -4347,6 +4368,148 @@ arch_validate_state() {
     [[ ! -v STATE[arch_sof] || "${STATE[arch_sof]}" =~ ^(true|false)$ ]] || die "invalid saved SOF selection"
     [[ ! -v STATE[arch_graphics] || "${STATE[arch_graphics]}" =~ ^(intel-legacy|intel-modern|amd|radeon|nvidia-open|nvidia-closed|virtual)(,(intel-legacy|intel-modern|amd|radeon|nvidia-open|nvidia-closed|virtual))*$ ]] || die "invalid saved graphics selection"
 }
+
+arch_policy_revision_is_valid() {
+    [[ "$1" =~ ^([0-9a-f]{40}|legacy-[0-9a-f]{64})$ ]]
+}
+
+select_arch_snapshot() {
+    arch_policy_revision_is_valid "$1" || die "invalid resolved Arch policy revision"
+    ARCH_POLICY_REF="$1"
+    ARCH_DATA="$NEUROARCH_CACHE/$ARCH_POLICY_REF"
+}
+
+arch_payload_is_valid() {
+    local source="$1" kind="${2:-published}" file directory
+    [[ -d "$source" && ! -L "$source" && ! -e "$source/.git" ]] || return 1
+    [[ -z "$(find "$source" ! -type d ! -type f -print -quit)" ]] || return 1
+    [[ "$kind" == legacy || "$(cat "$source/schema" 2>/dev/null)" == 1 ]] || return 1
+    for file in btrfs-subvolumes packages/minimal.list packages/installer-tools.list \
+        packages/aur-build.list packages/aur-helper.list \
+        pkgbuilds/dwl-neuroleptic/PKGBUILD pkgbuilds/nchat-git/PKGBUILD; do
+        [[ -s "$source/$file" && ! -L "$source/$file" ]] || return 1
+    done
+    for directory in boot pacman system; do
+        [[ -d "$source/$directory" && ! -L "$source/$directory" ]] || return 1
+    done
+}
+
+validate_arch_source() {
+    local source="${1:-$ARCH_DATA}" digest hash origin="$NEUROARCH_URL" kind=published
+    arch_policy_revision_is_valid "$ARCH_POLICY_REF" || return 1
+    if [[ "$ARCH_POLICY_REF" == legacy-* ]]; then origin=legacy-arch; kind=legacy; fi
+    [[ "$(readlink -m "$source")" == "$source" ]] || return 1
+    root_controls_directory "$source" && arch_payload_is_valid "$source" "$kind" || return 1
+    [[ -z "$(find "$source" \( ! -user root -o -perm /022 \) -print -quit)" ]] || return 1
+    [[ -f "$source/.install-system-revision" && -s "$source/.install-system-files.sha256" ]] || return 1
+    cmp -s "$source/.install-system-revision" <(printf '%s\n%s\n' "$origin" "$ARCH_POLICY_REF") || return 1
+    digest="$(portage_source_digest "$source")" || return 1
+    [[ "$digest" == "$(cat "$source/.install-system-files.sha256")" ]] || return 1
+    if [[ "$kind" == legacy ]]; then
+        hash="$(printf '%s\n' "$digest" | sha256sum)" || return 1
+        [[ "$ARCH_POLICY_REF" == "legacy-${hash%% *}" ]] || return 1
+    fi
+    return 0
+}
+
+legacy_arch_source() {
+    local source
+    local -a candidates=()
+    if [[ "$STATE_FILE" == "$TARGET_MOUNT$DEFAULT_STATE_FILE" ]]; then
+        candidates+=("$TARGET_MOUNT/usr/local/share/install-system/arch")
+    else
+        candidates+=(/usr/local/share/install-system/arch)
+    fi
+    candidates+=("$(dirname "$SCRIPT_PATH")/packaging/arch")
+    for source in "${candidates[@]}"; do
+        [[ -e "$source" || -L "$source" ]] || continue
+        arch_payload_is_valid "$source" legacy || die "saved Arch inputs are incomplete or unsafe: $source"
+        printf '%s' "$source"
+        return 0
+    done
+    return 1
+}
+
+ensure_arch_source() {
+    local save_state="${1:-yes}" source="" ref remote_ref digest
+    local origin="$NEUROARCH_URL" kind=published parent work target_source
+    if [[ -v STATE[arch_policy_ref] ]]; then
+        select_arch_snapshot "${STATE[arch_policy_ref]}"
+    elif ((ARCH_LEGACY_STATE)); then
+        source="$(legacy_arch_source)" || die "original Arch inputs are missing; restore them before resuming this legacy record"
+        digest="$(portage_source_digest "$source")" || die "could not verify original Arch inputs"
+        ref="$(printf '%s\n' "$digest" | sha256sum)"
+        select_arch_snapshot "legacy-${ref%% *}"
+    else
+        require_command git
+        remote_ref="$(git ls-remote --exit-code "$NEUROARCH_URL" "refs/heads/$NEUROARCH_BRANCH")" || \
+            die "could not resolve neuroarch/$NEUROARCH_BRANCH"
+        select_arch_snapshot "${remote_ref%%[[:space:]]*}"
+    fi
+    if [[ "$ARCH_POLICY_REF" == legacy-* ]]; then origin=legacy-arch; kind=legacy; fi
+    if ! validate_arch_source; then
+        [[ ! -e "$ARCH_DATA" && ! -L "$ARCH_DATA" ]] || \
+            die "cached Arch policy has changed; preserve/review it before continuing: $ARCH_DATA"
+        target_source="$TARGET_MOUNT$ARCH_DATA"
+        if [[ -e "$target_source" || -L "$target_source" ]]; then
+            validate_arch_source "$target_source" || die "target Arch policy has changed; preserve/review it before continuing"
+            source="$target_source"
+        elif [[ "$kind" == legacy ]]; then
+            [[ -n "$source" ]] || source="$(legacy_arch_source)" || die "original Arch inputs are missing; restore them before resuming"
+            digest="$(portage_source_digest "$source")" || die "could not verify original Arch inputs"
+            ref="$(printf '%s\n' "$digest" | sha256sum)"
+            [[ "$ARCH_POLICY_REF" == "legacy-${ref%% *}" ]] || die "original Arch inputs differ from the saved policy; preserve/review them"
+        fi
+        parent="$(dirname "$ARCH_DATA")"
+        [[ "$(readlink -m "$parent")" == "$parent" ]] || die "symlinked Arch snapshot parent"
+        install -d -m 0755 "$parent"
+        root_controls_directory "$parent" || die "Arch snapshot parent is not controlled by root"
+        work="$(mktemp -d "$parent/.prepare.XXXXXX")"
+        if ! (
+            if [[ -n "$source" ]]; then
+                mkdir "$work/tree" || exit 1
+                cp -a --no-preserve=ownership "$source/." "$work/tree/" || exit 1
+            else
+                git clone --no-checkout --branch "$NEUROARCH_BRANCH" "$NEUROARCH_URL" "$work/git" || exit 1
+                git -C "$work/git" cat-file -e "$ARCH_POLICY_REF^{commit}" 2>/dev/null || \
+                    git -C "$work/git" fetch origin "$ARCH_POLICY_REF" || exit 1
+                mkdir "$work/tree" || exit 1
+                git -C "$work/git" archive "$ARCH_POLICY_REF" | tar -xf - -C "$work/tree" || exit 1
+            fi
+            arch_payload_is_valid "$work/tree" "$kind" || exit 1
+            printf '%s\n%s\n' "$origin" "$ARCH_POLICY_REF" >"$work/tree/.install-system-revision" || exit 1
+            portage_source_digest "$work/tree" >"$work/tree/.install-system-files.sha256" || exit 1
+            chmod -R u=rwX,go=rX "$work/tree" || exit 1
+            validate_arch_source "$work/tree" || exit 1
+        ); then
+            rm -rf --one-file-system -- "$work"
+            die "Arch policy could not be prepared; neuroarch/$NEUROARCH_BRANCH must provide schema 1"
+        fi
+        mv -T -- "$work/tree" "$ARCH_DATA"
+        rm -rf --one-file-system -- "$work"
+        validate_arch_source || die "Arch snapshot verification failed"
+    fi
+    if [[ "$save_state" == yes && ! -v STATE[arch_policy_ref] ]]; then state_set arch_policy_ref "$ARCH_POLICY_REF"; fi
+    ARCH_LEGACY_STATE=0
+}
+
+copy_arch_source_to_target() (
+    local destination="$TARGET_MOUNT$ARCH_DATA" parent temporary
+    validate_arch_source || die "host Arch snapshot is invalid"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        validate_arch_source "$destination" || die "target Arch snapshot has changed; preserve/review it"
+        return 0
+    fi
+    parent="$(dirname "$destination")"
+    [[ "$(readlink -m "$parent")" == "$parent" ]] || die "symlinked target Arch snapshot parent"
+    install -d -m 0755 "$parent"
+    root_controls_directory "$parent" || die "target Arch snapshot parent is not controlled by root"
+    temporary="$(mktemp -d "$parent/.copy.XXXXXX")"
+    trap 'rm -rf --one-file-system -- "$temporary"' EXIT
+    cp -a --no-preserve=ownership "$ARCH_DATA/." "$temporary" || die "could not copy Arch snapshot"
+    validate_arch_source "$temporary" || die "copied Arch snapshot failed verification"
+    mv -T -- "$temporary" "$destination"
+)
 
 arch_read_list() {
     local file="$ARCH_DATA/$1" line
@@ -4504,12 +4667,13 @@ arch_validate_host() {
     [[ "$(uname -m)" == x86_64 && -d /sys/firmware/efi ]] || return 1
     tools="$(arch_host_tools)" || return 1
     for tool in $tools; do command -v "$tool" >/dev/null || return 1; done
-    [[ -f "$ARCH_DATA/packages/minimal.list" && -f "$ARCH_DATA/btrfs-subvolumes" ]]
+    validate_arch_source
 }
 
 arch_host_preflight() {
     require_root
-    arch_validate_host || die "Arch new mode needs an x86_64 UEFI Arch ISO, arch-install-scripts, filesystem tools and packaging/arch alongside the installer"
+    ensure_arch_source
+    arch_validate_host || die "Arch new mode needs an x86_64 UEFI Arch ISO, arch-install-scripts, filesystem tools and valid neuroarch inputs"
     python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "Python 3.9+ is required"
     # Fail on missing/malformed selection files before touching the target disk.
     local lists
@@ -4617,16 +4781,10 @@ arch_fstab_contents() {
 }
 
 arch_target_setup() {
-    local destination="$TARGET_MOUNT/usr/local/share/install-system/arch"
     mount_target_boot
     copy_common_data
-    install -d -m 0755 "$TARGET_MOUNT/usr/local/sbin" "$(dirname "$destination")"
-    if [[ -d "$destination" ]]; then
-        diff -qr "$ARCH_DATA" "$destination" || die "Arch installation inputs differ from the target copy; use the original installation inputs to resume"
-    else
-        cp -a --no-preserve=ownership "$ARCH_DATA" "$destination"
-        chmod -R u=rwX,go=rX "$destination"
-    fi
+    copy_arch_source_to_target
+    install -d -m 0755 "$TARGET_MOUNT/usr/local/sbin"
     if [[ -f "$TARGET_MOUNT/etc/fstab" ]] && grep -Eq '^[[:space:]]*[^#[:space:]]' "$TARGET_MOUNT/etc/fstab"; then
         cmp -s "$TARGET_MOUNT/etc/fstab" <(arch_fstab_contents) || die "target /etc/fstab differs from the selected layout; review it before continuing"
     fi
@@ -4644,7 +4802,7 @@ arch_target_setup() {
 arch_validate_target_setup() {
     cmp -s "$SCRIPT_PATH" "$TARGET_MOUNT/usr/local/sbin/install-system" &&
         common_data_matches "$TARGET_MOUNT/usr/local/share/install-system/common" &&
-        diff -qr "$ARCH_DATA" "$TARGET_MOUNT/usr/local/share/install-system/arch" >/dev/null &&
+        validate_arch_source "$TARGET_MOUNT$ARCH_DATA" &&
         cmp -s "$TARGET_MOUNT/etc/fstab" <(arch_fstab_contents) &&
         findmnt -rn -S "$BOOT_PARTITION" -M "$TARGET_MOUNT/efi" >/dev/null &&
         [[ ! -L "$TARGET_MOUNT/etc/resolv.conf" ]] && cmp -s /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
@@ -4659,7 +4817,7 @@ arch_target_preflight() {
 }
 
 arch_validate_target() {
-    [[ -e /etc/arch-release && -d "$ARCH_DATA/packages" ]] && command -v pacman >/dev/null && current_root_matches_state
+    [[ -e /etc/arch-release ]] && validate_arch_source && command -v pacman >/dev/null && current_root_matches_state
 }
 
 arch_managed_file() {
@@ -4937,7 +5095,7 @@ arch_existing_preflight() {
     arch_is_installed_system || die "existing mode requires Arch Linux"
     [[ "$(cat /etc/machine-id)" == "${STATE[system_id]}" ]] || die "state belongs to another system"
     user_home_is_safe || die "unsafe target user"
-    [[ -d "$ARCH_DATA/packages" ]] || die "keep packaging/arch beside the installer"
+    validate_arch_source || die "invalid saved Arch policy"
     if ! arch_existing_packages_ready; then
         request_wait 'existing mode does not upgrade the base, kernel or boot setup. Review and perform a full pacman -Syu separately, then continue. Do not use pacman -Sy or a partial upgrade.'
         return 0
@@ -5055,6 +5213,7 @@ arch_validate_full_complete() {
 
 arch_run_target() {
     ((KERNEL_CONFIG_READY == 0)) || die "Arch uses the selected packaged kernel; --kernel-config-ready is Gentoo-only"
+    ensure_arch_source
     if [[ "$MODE" == existing || "$(state_stage_status accounts)" == done ]]; then select_existing_user; fi
     set_tier_features
     local -a sequence=()

@@ -1,2 +1,0 @@
-# The stock AUR recipe disables Signal; this recipe enables all three protocols.
-nchat-git

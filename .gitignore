@@ -1,9 +1,8 @@
-# Publish the installer, documentation and shared/Arch runtime inputs.
+# Publish the installer, documentation and shared runtime inputs only.
 /*
 !/.gitignore
 !/README.md
 !/install_system.sh
 !/packaging/
 /packaging/*
-!/packaging/arch/
 !/packaging/common/
