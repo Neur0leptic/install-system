@@ -82,8 +82,6 @@ EFI partitions can be reused without formatting. Gentoo kernel configuration
 remains manual and requires readiness confirmation before compilation.
 
 Display and input preferences are collected interactively and saved for reuse.
-Public dotfiles work without private access. Private dotfiles are offered only
-for the `neuroleptic` account and may be declined.
 
 ## Related repositories
 
