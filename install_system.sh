@@ -73,6 +73,7 @@ declare -a MINIMAL_SEQUENCE=(
     base-cleanup:phase_base_cleanup:validate_base_packages
     system-config:phase_system_config:validate_system_config
     accounts:phase_accounts:validate_accounts
+    account-shell:phase_user_shell:validate_user_shell
     network:phase_network:validate_network
     fstab:phase_fstab:validate_fstab
     kernel-config:phase_kernel_config:validate_kernel_config_stage
@@ -87,8 +88,12 @@ declare -a DWL_SEQUENCE=(
     display-config:phase_display_config:validate_display_config
     desktop-repositories:phase_desktop_repositories:validate_desktop_repositories
     desktop-packages:phase_desktop_packages:validate_desktop_packages
+    user-shell:phase_user_shell:validate_user_shell
     dwl-build:phase_dwl_build:validate_dwl_build
     public-dotfiles:phase_public_dotfiles:validate_public_dotfiles
+    librewolf-setup:phase_librewolf_setup:validate_librewolf_setup
+    browser-theme:phase_browser_theme:validate_browser_theme
+    browser-extensions:phase_browser_extensions:validate_browser_extensions
     private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
     dwl-complete:phase_marker:validate_dwl_complete
 )
@@ -96,6 +101,8 @@ declare -a FULL_SEQUENCE=(
     dwl-to-full:phase_dwl_to_full_approval:validate_dwl_to_full_approval
     full-packages:phase_full_packages:validate_full_packages
     full-public-dotfiles:phase_public_dotfiles:validate_public_dotfiles
+    full-browser-theme:phase_browser_theme:validate_browser_theme
+    full-browser-extensions:phase_browser_extensions:validate_browser_extensions
     full-private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
     source-apps:phase_source_apps:validate_source_apps
     binary-apps:phase_binary_apps:validate_binary_apps
@@ -284,7 +291,7 @@ root_lock_file_is_safe() {
 }
 
 valid_state_key() {
-    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full)|stage\.[a-z0-9-]+)$ ]]
+    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
 }
 
 valid_state_value() {
@@ -307,6 +314,8 @@ validate_loaded_state() {
     [[ "${STATE[mode]}" =~ ^(new|existing)$ ]] || die "invalid mode in state"
     [[ "${STATE[mode]}" != "existing" || "${STATE[tier]}" != "minimal" ]] || die "invalid existing-mode tier in state"
     [[ "${STATE[username]:-}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "invalid username in state"
+    [[ ! -v STATE[user_shell] || "${STATE[user_shell]}" == /bin/zsh ]] || die "invalid target shell in state"
+    [[ ! -v STATE[librewolf_setup_result] || "${STATE[librewolf_setup_result]}" =~ ^(success|failed)$ ]] || die "invalid LibreWolf setup result in state"
     [[ "${STATE[hostname]:-}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,61}[a-zA-Z0-9])?$ ]] || die "invalid hostname in state"
     [[ "${STATE[timezone]:-}" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)+$ ]] || die "invalid timezone in state"
     [[ "${STATE[gpu_profile]:-}" =~ ^(auto|intel-x220|modern-amd-intel|nvidia|mesa)$ ]] || die "invalid GPU profile in state"
@@ -316,7 +325,7 @@ validate_loaded_state() {
     done
     [[ "${STATE[private_dotfiles]:-}" =~ ^(ask|yes|no)$ ]] || die "invalid private-dotfiles state"
     [[ "${STATE[efi_entry]:-}" =~ ^(yes|no)$ ]] || die "invalid EFI-entry state"
-    for key in approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full; do
+    for key in approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
         [[ ! -v "STATE[$key]" || "${STATE[$key]}" == "yes" ]] || die "invalid tier approval state: $key"
     done
     if [[ "${STATE[mode]}" == "new" ]]; then
@@ -450,6 +459,7 @@ state_initialize() {
         STATE[repositories]="$REPOSITORIES"
     fi
     STATE[username]="$USERNAME"
+    [[ "$MODE" != new ]] || STATE[user_shell]=/bin/zsh
     STATE[hostname]="$HOSTNAME_VALUE"
     STATE[timezone]="$TIMEZONE"
     STATE[torrent]="$TORRENT"
@@ -1096,7 +1106,7 @@ show_status() {
     fi
     state_load
     printf 'State file: %s\n' "$STATE_FILE"
-    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full; do
+    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
         [[ -n "${STATE[$key]:-}" ]] && printf '%-18s %s\n' "$key:" "${STATE[$key]}"
     done
     printf 'Stages:\n'
@@ -1214,9 +1224,11 @@ ensure_github_known_host() {
 }
 
 run_as_user() {
-    local home="/home/$USERNAME"
+    local home="/home/$USERNAME" account_shell
+    account_shell="$(getent passwd "$USERNAME" | cut -d: -f7)" || return 1
+    [[ "$account_shell" == /* ]] || die "target account has no valid shell"
     local -a clean_env=(
-        "HOME=$home" "USER=$USERNAME" "LOGNAME=$USERNAME" "SHELL=/bin/bash"
+        "HOME=$home" "USER=$USERNAME" "LOGNAME=$USERNAME" "SHELL=$account_shell"
         "XDG_CONFIG_HOME=$home/.config"
         "XDG_DATA_HOME=$home/.local/share"
         "XDG_CACHE_HOME=$home/.cache"
@@ -2840,10 +2852,28 @@ account_password_is_set() {
     [[ "$name" == "$account" ]] && password_hash_is_set "$password"
 }
 
+gentoo_account_shell() {
+    # An approved shell transition must not replace an older compiler-policy snapshot.
+    local current
+    if [[ -n "${STATE[user_shell]:-}" ]]; then
+        printf '%s' "${STATE[user_shell]}"
+        return 0
+    fi
+    if [[ "${STATE[approval.user-shell]:-}" == yes ]]; then
+        current="$(getent passwd "$USERNAME" | cut -d: -f7)" || return 1
+        # Account changes can succeed just before the result is persisted.
+        if [[ "$(readlink -f "$current")" == "$(readlink -f /bin/zsh)" ]]; then
+            printf '%s' /bin/zsh
+            return 0
+        fi
+    fi
+    cat "$NEUROGENTOO_ROOT/config/system/minimal/account-shell"
+}
+
 phase_accounts() {
     local group groups="" separator="" account_shell
     local -a requested_groups=()
-    account_shell="$(cat "$NEUROGENTOO_ROOT/config/system/minimal/account-shell")"
+    account_shell="$(gentoo_account_shell)"
     [[ "$account_shell" == /* && -x "$account_shell" ]] || die "invalid account shell policy"
     mapfile -t requested_groups < <(system_policy_groups minimal)
     ((${#requested_groups[@]})) || die "missing minimal account groups"
@@ -2861,7 +2891,7 @@ phase_accounts() {
         fi
     else
         user_home_is_safe || die "refusing to modify an unsafe existing account: $USERNAME"
-        [[ "$(getent passwd "$USERNAME" | cut -d: -f7)" == "$account_shell" ]] || \
+        [[ "$(readlink -f "$(getent passwd "$USERNAME" | cut -d: -f7)")" == "$(readlink -f "$account_shell")" ]] || \
             die "existing account shell differs from policy; preserve/review it before continuing"
         if [[ -n "$groups" ]]; then
             run usermod --append --groups "$groups" -- "$USERNAME"
@@ -2878,7 +2908,7 @@ phase_accounts() {
 validate_accounts() {
     local _ shell group groups
     IFS=: read -r _ _ _ _ _ _ shell < <(getent passwd "$USERNAME") || return 1
-    [[ "$shell" == "$(cat "$NEUROGENTOO_ROOT/config/system/minimal/account-shell")" ]] || return 1
+    [[ "$(readlink -f "$shell")" == "$(readlink -f "$(gentoo_account_shell)")" ]] || return 1
     groups=" $(id -nG "$USERNAME") " || return 1
     [[ "$groups" == *" $USERNAME "* ]] || return 1
     local policy_groups
@@ -3269,6 +3299,37 @@ validate_desktop_packages() {
     system_policy_services check dwl && system_policy check dwl etc/pam.d/system-login
 }
 
+phase_user_shell() {
+    local current answer
+    [[ "$USERNAME" != root ]] && user_home_is_safe || die "unsafe target account for Zsh"
+    [[ -x /bin/zsh ]] || die "installed packages must provide Zsh before changing the target shell"
+    current="$(getent passwd "$USERNAME" | cut -d: -f7)"
+    if [[ "$(readlink -f "$current")" != "$(readlink -f /bin/zsh)" ]]; then
+        if [[ "${STATE[approval.user-shell]:-}" != yes ]]; then
+            if ((NON_INTERACTIVE)); then
+                request_wait "target shell is $current; approve the change to Zsh interactively before continuing"
+                return 0
+            fi
+            read -r -p "Change $USERNAME's shell from $current to Zsh? [y/N] " answer
+            if [[ ! "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
+                request_wait "Zsh is required for the target user; existing shell preserved"
+                return 0
+            fi
+            state_set approval.user-shell yes
+        fi
+        run usermod --shell /bin/zsh -- "$USERNAME"
+    fi
+    state_set user_shell /bin/zsh
+}
+
+validate_user_shell() {
+    local current
+    [[ "$USERNAME" != root && "${STATE[user_shell]:-}" == /bin/zsh && -x /bin/zsh ]] || return 1
+    user_home_is_safe || return 1
+    current="$(getent passwd "$USERNAME" | cut -d: -f7)" || return 1
+    [[ "$(readlink -f "$current")" == "$(readlink -f /bin/zsh)" ]]
+}
+
 ensure_public_dotfiles_source() {
     local home="/home/$USERNAME" source parent temporary branch upstream
     source="$home/.local/share/chezmoi"
@@ -3307,7 +3368,7 @@ ensure_public_dotfiles_source() {
     if [[ -z "$upstream" ]]; then
         run_as_user git -C "$source" branch --set-upstream-to="origin/$PUBLIC_DOTFILES_BRANCH" "$PUBLIC_DOTFILES_BRANCH"
     fi
-    public_dotfiles_source_valid || die "public dotfiles needs published machine-settings support on $PUBLIC_DOTFILES_BRANCH; use the existing sync workflow"
+    public_dotfiles_source_valid || die "public dotfiles needs published machine-settings, shell, browser-theme and extension support on $PUBLIC_DOTFILES_BRANCH; use the existing sync workflow"
 }
 
 public_dotfiles_checkout_is_safe() {
@@ -3331,7 +3392,11 @@ public_dotfiles_source_valid() {
     # Later synchronized commits are valid. Only unpublished/local work is blocked.
     run_as_user git -C "$source" merge-base --is-ancestor HEAD "origin/$PUBLIC_DOTFILES_BRANCH" || return 1
     [[ -s "$source/.chezmoitemplates/machine-settings" && -s "$source/.chezmoidata/machinePresets.json" ]] &&
-        grep -q 'DWL_TAG_OUTPUT_' "$source/dot_config/dwl/patches/0001-neuroleptic.patch"
+        grep -q 'DWL_TAG_OUTPUT_' "$source/dot_config/dwl/patches/0001-neuroleptic.patch" &&
+        [[ -s "$source/dot_config/shell/env.sh.tmpl" &&
+           -s "$source/dot_local/bin/executable_setup_browser_theme.sh" &&
+           -s "$source/dot_config/browser-extensions.json" &&
+           -s "$source/dot_librewolf/librewolf.overrides.cfg" ]]
 }
 
 user_owned_directory_is_safe() {
@@ -3520,7 +3585,7 @@ validate_public_dotfiles() {
     source="$home/.local/share/chezmoi"
     public_dotfiles_source_valid && validate_public_preferences "$stage" &&
         [[ -s "$home/.config/chezmoi/chezmoi.toml" ]] &&
-        validate_desktop_dotfiles &&
+        validate_desktop_dotfiles && validate_shell_theme_dotfiles &&
         [[ -x "$home/.local/bin/waybar_toggle.sh" ]] &&
         [[ -x "$home/.local/bin/recorder.sh" ]] &&
         [[ -s "$home/.config/yazi/plugins/mount.yazi/sudo.lua" ]] &&
@@ -3532,6 +3597,114 @@ validate_public_dotfiles() {
         [[ -s "$home/.config/zsh/zsh-autosuggestions/zsh-autosuggestions.zsh" ]] &&
         { [[ "$stage" != full-public-dotfiles ]] ||
             [[ -x "$home/.local/bin/wireguard.sh" && -d "$home/.local/share/wireguard/.git" ]]; }
+}
+
+validate_shell_theme_dotfiles() {
+    local home="/home/$USERNAME" source file rendered
+    source="$home/.local/share/chezmoi"
+    for file in .zshenv .config/shell/env.sh .config/zsh/.zprofile .config/zsh/.zshrc \
+        .config/foot/foot.ini .config/librewolf/chrome/userChrome.css .config/librewolf/chrome/userContent.css \
+        .librewolf/librewolf.overrides.cfg .config/helium-browser-theme.json .config/browser-extensions.json \
+        .local/bin/setup_librewolf.sh .local/bin/setup_browser_theme.sh \
+        .local/share/themes/Neurowave/index.theme .local/share/themes/Neurowave/gtk-3.0/gtk.css \
+        .local/share/themes/Neurowave/gtk-4.0/gtk.css .local/share/Kvantum/Neurowave/Neurowave.kvconfig \
+        .local/share/Kvantum/Neurowave/Neurowave.svg .config/neurowave/apply.sh \
+        .config/neurowave/palette.sh .config/neurowave/palette.yaml; do
+        [[ -s "$home/$file" ]] || return 1
+        rendered="$(run_as_user chezmoi --source "$source" cat "$home/$file")" || return 1
+        [[ "$rendered" == "$(cat "$home/$file")" ]] || return 1
+    done
+    [[ -x "$home/.local/bin/setup_librewolf.sh" && -x "$home/.local/bin/setup_browser_theme.sh" &&
+       -x "$home/.config/neurowave/apply.sh" ]] || return 1
+    [[ "$(readlink "$home/.config/librewolf/librewolf/librewolf.overrides.cfg")" == "$home/.librewolf/librewolf.overrides.cfg" ]] || return 1
+    diff -qr "$source/dot_config/neurowave/templates" "$home/.config/neurowave/templates" >/dev/null
+}
+
+validate_librewolf_setup_outputs() {
+    local home="/home/$USERNAME" profile file
+    [[ -x "$home/.local/bin/setup_browser_theme.sh" ]] || return 1
+    profile="$(run_as_user "$home/.local/bin/setup_browser_theme.sh" --librewolf-profile)" || return 1
+    [[ "$profile" == "$home/"* && "$(readlink -m "$profile")" == "$profile" ]] || return 1
+    for file in user.js updater.sh prefsCleaner.sh; do
+        [[ -f "$profile/$file" && ! -L "$profile/$file" ]] && grep -qi arkenfox "$profile/$file" || return 1
+    done
+    [[ -x "$profile/updater.sh" && -x "$profile/prefsCleaner.sh" ]]
+}
+
+phase_librewolf_setup() {
+    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" result answer
+    [[ -x "$script" ]] || die "managed LibreWolf setup script is missing"
+    if [[ "${STATE[librewolf_setup_result]:-}" == failed && "${FORCE_STAGE:-}" != librewolf-setup ]]; then
+        if validate_librewolf_setup_outputs && ((NON_INTERACTIVE == 0)); then
+            read -r -p 'Did the unchanged LibreWolf setup script succeed when you reran it manually? [y/N] ' answer
+            if [[ "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
+                state_set librewolf_setup_result success
+                log "LibreWolf setup: manual success confirmed; existing profile retained."
+                return 0
+            fi
+        fi
+        request_wait "LibreWolf setup failed previously; rerun $script as $USERNAME and confirm success on resume, or select librewolf-setup to retry it"
+        return 0
+    fi
+    # Interruptions and explicit retries must not retain a previous success result.
+    state_set librewolf_setup_result failed
+    log "Calling the unchanged LibreWolf/Arkenfox setup script as $USERNAME."
+    if run_as_user "$script"; then
+        if validate_librewolf_setup_outputs; then
+            state_set librewolf_setup_result success
+            log "LibreWolf setup: SUCCESS (exit status 0)."
+            return 0
+        fi
+        warn "LibreWolf setup returned exit status 0, but its expected Arkenfox files are incomplete."
+    else
+        result=$?
+        warn "LibreWolf setup: FAILED (exit status $result)."
+    fi
+    state_set librewolf_setup_result failed
+    request_wait "LibreWolf setup did not complete; its script is unchanged and can be rerun manually as $USERNAME"
+}
+
+validate_librewolf_setup() {
+    [[ "${STATE[librewolf_setup_result]:-}" == success ]] && validate_librewolf_setup_outputs
+}
+
+phase_browser_theme() {
+    local helper="/home/$USERNAME/.local/bin/setup_browser_theme.sh"
+    [[ -x "$helper" ]] || die "managed browser-theme helper is missing"
+    if ! run_as_user "$helper" --apply; then
+        request_wait "browser theme setup needs review; existing differing CSS and active Helium profiles are preserved"
+        return 0
+    fi
+    log "Browser theme setup: SUCCESS."
+}
+
+validate_browser_theme() {
+    local helper="/home/$USERNAME/.local/bin/setup_browser_theme.sh"
+    [[ -x "$helper" ]] && run_as_user "$helper" --check
+}
+
+browser_extension_policies() {
+    local mode="$1" defaults="" candidate manifest="/home/$USERNAME/.config/browser-extensions.json"
+    [[ -s "$COMMON_DATA/browser-extensions.sh" && -f "$manifest" && ! -L "$manifest" ]] || return 1
+    for candidate in /usr/lib/librewolf/distribution/policies.json /usr/lib64/librewolf/distribution/policies.json /opt/librewolf/distribution/policies.json; do
+        if [[ -f "$candidate" ]]; then defaults="$(readlink -f -- "$candidate")"; break; fi
+    done
+    [[ -n "$defaults" ]] || { warn "LibreWolf's packaged policy file was not found"; return 1; }
+    bash "$COMMON_DATA/browser-extensions.sh" "$mode" "$manifest" "$defaults" \
+        /etc/librewolf/policies/policies.json /etc/chromium/policies/managed
+}
+
+phase_browser_extensions() {
+    if ! browser_extension_policies apply; then
+        request_wait "browser extension policies need review; conflicting settings are preserved"
+        return 0
+    fi
+    log "Browser extension policies: READY; first online startup installs extensions, without locking disable controls."
+    log "Helium extension downloads require its normal services/proxy consent; no browser was started or closed."
+}
+
+validate_browser_extensions() {
+    browser_extension_policies check
 }
 
 validate_desktop_dotfiles() {
@@ -4208,6 +4381,7 @@ configure_sequences() {
             base-packages:arch_base_packages:arch_validate_base
             system-config:arch_system_config:arch_validate_system
             accounts:arch_accounts:arch_validate_accounts
+            account-shell:phase_user_shell:validate_user_shell
             aur-helper:arch_yay:arch_validate_yay
             snapshots:arch_snapshots:arch_validate_snapshots
             boot:arch_boot:arch_validate_boot
@@ -4221,7 +4395,11 @@ configure_sequences() {
             minimal-to-desktop:arch_approve_desktop:arch_desktop_approved
             display-config:phase_display_config:validate_display_config
             desktop-packages:arch_desktop_packages:arch_validate_desktop
+            user-shell:phase_user_shell:validate_user_shell
             public-dotfiles:phase_public_dotfiles:validate_public_dotfiles
+            librewolf-setup:phase_librewolf_setup:validate_librewolf_setup
+            browser-theme:phase_browser_theme:validate_browser_theme
+            browser-extensions:phase_browser_extensions:validate_browser_extensions
             private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
             desktop-complete:phase_marker:arch_validate_desktop_complete
         )
@@ -4229,6 +4407,8 @@ configure_sequences() {
             desktop-to-full:arch_approve_full:arch_full_approved
             full-packages:arch_full_packages:arch_validate_full
             full-public-dotfiles:phase_public_dotfiles:validate_public_dotfiles
+            full-browser-theme:phase_browser_theme:validate_browser_theme
+            full-browser-extensions:phase_browser_extensions:validate_browser_extensions
             full-private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
             full-complete:phase_marker:arch_validate_full_complete
         )
@@ -4624,7 +4804,7 @@ arch_prepare_hardware() {
 
 copy_common_data() {
     local destination="$TARGET_MOUNT/usr/local/share/install-system/common"
-    [[ -s "$COMMON_DATA/hardware.py" && -s "$COMMON_DATA/displays.py" ]] || die "keep packaging/common beside the installer"
+    [[ -s "$COMMON_DATA/hardware.py" && -s "$COMMON_DATA/displays.py" && -s "$COMMON_DATA/browser-extensions.sh" ]] || die "keep packaging/common beside the installer"
     install -d -m 0755 "$(dirname "$destination")"
     if [[ -d "$destination" ]]; then
         common_data_matches "$destination" || die "shared installation inputs differ; resume with matching inputs"
@@ -4932,7 +5112,7 @@ arch_accounts() {
         run useradd --create-home --user-group --groups wheel --shell /bin/zsh "$USERNAME"
     fi
     user_home_is_safe || die "unsafe target user"
-    [[ "$(getent passwd "$USERNAME" | cut -d: -f7)" == /bin/zsh ]] || die "target shell differs; review the existing account"
+    [[ "$(readlink -f "$(getent passwd "$USERNAME" | cut -d: -f7)")" == "$(readlink -f /bin/zsh)" ]] || die "target shell differs; review the existing account"
     run usermod --append --groups wheel "$USERNAME"
     printf '%%wheel ALL=(ALL:ALL) ALL\n' | arch_managed_file /etc/sudoers.d/10-install-system 0440
     run visudo -cf /etc/sudoers
@@ -4942,7 +5122,7 @@ arch_accounts() {
 
 arch_validate_accounts() {
     user_home_is_safe && [[ " $(id -nG "$USERNAME") " == *' wheel '* ]] &&
-        [[ "$(getent passwd "$USERNAME" | cut -d: -f7)" == /bin/zsh ]] &&
+        [[ "$(readlink -f "$(getent passwd "$USERNAME" | cut -d: -f7)")" == "$(readlink -f /bin/zsh)" ]] &&
         [[ -d "/home/$USERNAME/.cache/install-system" ]] &&
         grep -qxF '%wheel ALL=(ALL:ALL) ALL' /etc/sudoers.d/10-install-system &&
         visudo -cf /etc/sudoers >/dev/null && account_password_is_set root && account_password_is_set "$USERNAME"

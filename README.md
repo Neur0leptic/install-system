@@ -83,6 +83,15 @@ EFI partitions can be reused without formatting. Gentoo kernel configuration
 remains manual and requires readiness confirmation before compilation.
 
 Display and input preferences are collected interactively and saved for reuse.
+New user accounts use Zsh on both distributions. Existing users require
+approval before switching a different shell to Zsh.
+
+The installer calls the existing LibreWolf/Arkenfox setup script and reports its
+result. Browser theme files and extension selections are managed separately.
+The `browser-extensions` stage prepares native automatic-install policies for
+LibreWolf and Helium; downloads occur on online browser startup. Helium retains
+its normal extension-proxy consent. Routine dotfile synchronization does not
+rerun Arkenfox, install extensions or regenerate application configurations.
 
 ## Related repositories
 
