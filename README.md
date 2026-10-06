@@ -76,22 +76,18 @@ Available options:
 ./install_system.sh --help
 ```
 
-## Confirmations and dotfiles
+## Configuration and dotfiles
 
-Disk changes and package-tier upgrades require confirmation. Prepared root and
-EFI partitions can be reused without formatting. Gentoo kernel configuration
-remains manual and requires readiness confirmation before compilation.
+The installer asks for account, display and input preferences and saves the
+selected settings for reuse. Chezmoi manages the dotfiles; new accounts use Zsh.
 
-Display and input preferences are collected interactively and saved for reuse.
-New user accounts use Zsh on both distributions. Existing users require
-approval before switching a different shell to Zsh.
+Prepared root and EFI partitions can be reused without formatting. Disk changes
+require confirmation. Package-tier upgrades and switching an existing account to
+Zsh also require confirmation. The Gentoo kernel must be configured manually
+before compilation.
 
-The installer calls the existing LibreWolf/Arkenfox setup script and reports its
-result. Browser theme files and extension selections are managed separately.
-The `browser-extensions` stage prepares native automatic-install policies for
-LibreWolf and Helium; downloads occur on online browser startup. Helium retains
-its normal extension-proxy consent. Routine dotfile synchronization does not
-rerun Arkenfox, install extensions or regenerate application configurations.
+Browser setup applies themes and configures automatic extension installation for
+LibreWolf and Helium. It also runs LibreWolf's setup script.
 
 ## Related repositories
 
