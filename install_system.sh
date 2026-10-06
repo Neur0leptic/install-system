@@ -3413,7 +3413,8 @@ public_dotfiles_source_valid() {
         [[ -s "$source/dot_config/shell/env.sh.tmpl" &&
            -s "$source/dot_local/bin/executable_setup_browser_theme.sh" &&
            -s "$source/dot_config/browser-extensions.json" &&
-           -s "$source/dot_librewolf/librewolf.overrides.cfg" ]]
+           ( -s "$source/private_dot_librewolf/librewolf.overrides.cfg" ||
+             -s "$source/dot_librewolf/librewolf.overrides.cfg" ) ]]
 }
 
 user_owned_directory_is_safe() {
