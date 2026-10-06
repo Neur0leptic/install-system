@@ -943,6 +943,9 @@ prompt_identity() {
         read -r -p 'Username: ' USERNAME
     fi
     [[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "invalid username"
+    if [[ "$MODE" == new ]] && system_account_name "$USERNAME"; then
+        die "username is reserved for a system account or group: $USERNAME"
+    fi
     if [[ "$MODE" == new ]] && ((DRY_RUN == 0)); then collect_password; fi
     HOSTNAME_VALUE="${HOSTNAME_VALUE:-$USERNAME}"
     [[ "$HOSTNAME_VALUE" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,61}[a-zA-Z0-9])?$ ]] || die "invalid hostname"
@@ -954,6 +957,18 @@ prompt_identity() {
         select_timezone
     fi
     [[ "$TIER" != full ]] || select_torrent
+}
+
+system_account_name() {
+    # Reject the account before long builds; useradd would refuse it only later.
+    # The live environment shares common system users and groups with the target.
+    local entry id
+    for entry in "$(getent passwd "$1" || true)" "$(getent group "$1" || true)"; do
+        [[ -n "$entry" ]] || continue
+        IFS=: read -r _ _ id _ <<<"$entry"
+        ((id < 1000 || id >= 60000)) && return 0
+    done
+    return 1
 }
 
 choose_number() {
@@ -1107,11 +1122,12 @@ show_status() {
     state_load
     printf 'State file: %s\n' "$STATE_FILE"
     for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
-        [[ -n "${STATE[$key]:-}" ]] && printf '%-18s %s\n' "$key:" "${STATE[$key]}"
+        [[ -z "${STATE[$key]:-}" ]] || printf '%-18s %s\n' "$key:" "${STATE[$key]}"
     done
     printf 'Stages:\n'
+    # An unset final stage must not become the function's (failing) exit status.
     for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
-        [[ -n "${STATE["stage.$stage"]:-}" ]] && printf '  %-24s %s\n' "$stage" "${STATE["stage.$stage"]}"
+        [[ -z "${STATE["stage.$stage"]:-}" ]] || printf '  %-24s %s\n' "$stage" "${STATE["stage.$stage"]}"
     done
 }
 
@@ -1500,7 +1516,8 @@ host_preflight() {
     [[ -d /sys/firmware/efi ]] || die "new mode requires an UEFI-booted environment"
     # The minimal ISO removes diffutils but retains BusyBox's cmp applet.
     if ! command -v cmp >/dev/null; then
-        busybox --list | grep -qx cmp || die "cmp (or the BusyBox cmp applet) is required"
+        # grep -q may close the pipe before BusyBox finishes: SIGPIPE under pipefail.
+        busybox --list | grep -x cmp >/dev/null || die "cmp (or the BusyBox cmp applet) is required"
         cmp() { busybox cmp "$@"; }
     fi
     local command
@@ -2763,7 +2780,7 @@ validate_base_packages() {
         command -v busybox >/dev/null && command -v nvim >/dev/null &&
         command -v ninja >/dev/null && command -v pipewire >/dev/null &&
         command -v seatd >/dev/null && command -v wireplumber >/dev/null &&
-        busybox --list | grep -qx udhcpc
+        busybox --list | grep -x udhcpc >/dev/null
 }
 
 system_policy() {
@@ -2932,7 +2949,7 @@ validate_network() {
     system_policy check minimal etc/resolv.conf &&
         system_policy check network usr/local/sbin/udhcpc-all etc/udhcpc/default.script etc/init.d/udhcpc &&
         sh -n /usr/local/sbin/udhcpc-all && sh -n /etc/udhcpc/default.script &&
-        busybox --list | grep -qx udhcpc &&
+        busybox --list | grep -x udhcpc >/dev/null &&
         system_policy_services check network
 }
 
@@ -3506,14 +3523,17 @@ phase_public_dotfiles() {
     if [[ -z "$GPG_RECIPIENT" ]]; then
         GPG_RECIPIENT="$(detect_gpg_recipient || true)"
     fi
-    if [[ -z "$GPG_RECIPIENT" ]]; then
+    # Public files are not encrypted; an empty recipient disables chezmoi encryption.
+    # Only the private payload (offered to neuroleptic unless declined) needs one.
+    if [[ -z "$GPG_RECIPIENT" && "$USERNAME" == neuroleptic && "$PRIVATE_DOTFILES" != no ]]; then
         if ((NON_INTERACTIVE)); then
-            request_wait "public chezmoi requires --gpg-recipient or a restored user secret key"
+            request_wait "private chezmoi requires --gpg-recipient or a restored user secret key"
             return 0
         fi
         read -r -p 'GPG recipient fingerprint for chezmoi: ' GPG_RECIPIENT
+        [[ -n "$GPG_RECIPIENT" ]] || die "private dotfiles need a GPG recipient; use --no-private-dotfiles to skip them"
     fi
-    [[ "$GPG_RECIPIENT" =~ ^[0-9A-Fa-f]{40}$ ]] || die "invalid GPG recipient fingerprint"
+    [[ -z "$GPG_RECIPIENT" || "$GPG_RECIPIENT" =~ ^[0-9A-Fa-f]{40}$ ]] || die "invalid GPG recipient fingerprint"
     GPG_RECIPIENT="${GPG_RECIPIENT^^}"
     validate_display_config || die "approved desktop preferences are missing"
     display_answers="$(cat "$(hardware_root)/displays.json")"
@@ -3958,12 +3978,15 @@ validate_full_packages() {
     validate_policy_sets "${POLICY_LAYERS[@]}" || return 1
     required_files check "${POLICY_LAYERS[@]}" || return 1
     [[ "$TORRENT" != yes ]] || system_policy check torrent etc/init.d/flaresolverr || return 1
-    local command
+    local command encoders
+    # Read the whole list first: grep -q closing the pipe early makes ffmpeg exit
+    # with SIGPIPE, which pipefail reports as a failed check.
+    encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)" || return 1
     for command in aac libopus libx264; do
-        ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw "$command" || return 1
+        grep -qw "$command" <<<"$encoders" || return 1
     done
     if hardware_field graphics.families | grep -q nvidia; then
-        ffmpeg -hide_banner -encoders 2>/dev/null | grep -qw h264_nvenc || return 1
+        grep -qw h264_nvenc <<<"$encoders" || return 1
     fi
     tesseract --list-langs 2>/dev/null | grep -qx deu || return 1
     [[ "$FEATURE_KEEPASS" != "true" ]] || python -c 'import pykeepass' >/dev/null 2>&1 || return 1
@@ -4721,7 +4744,7 @@ arch_check_lists() {
 }
 
 arch_user_command() {
-    # AUR builds keep a terminal so makepkg/yay can request the user's sudo password.
+    # AUR builds keep a terminal for interactive makepkg/yay prompts.
     local cpus memory jobs
     user_home_is_safe || die "unsafe target home"
     cpus="$(nproc)"
@@ -5114,7 +5137,8 @@ arch_accounts() {
     user_home_is_safe || die "unsafe target user"
     [[ "$(readlink -f "$(getent passwd "$USERNAME" | cut -d: -f7)")" == "$(readlink -f /bin/zsh)" ]] || die "target shell differs; review the existing account"
     run usermod --append --groups wheel "$USERNAME"
-    printf '%%wheel ALL=(ALL:ALL) ALL\n' | arch_managed_file /etc/sudoers.d/10-install-system 0440
+    # Passwordless like Gentoo's doas policy and the user's existing Arch setup.
+    printf '%%wheel ALL=(ALL:ALL) NOPASSWD: ALL\n' | arch_managed_file /etc/sudoers.d/10-install-system 0440
     run visudo -cf /etc/sudoers
     run_as_user install -d -m 0755 "/home/$USERNAME/.local/bin" "/home/$USERNAME/.cache/install-system"
     apply_collected_password
@@ -5124,7 +5148,7 @@ arch_validate_accounts() {
     user_home_is_safe && [[ " $(id -nG "$USERNAME") " == *' wheel '* ]] &&
         [[ "$(readlink -f "$(getent passwd "$USERNAME" | cut -d: -f7)")" == "$(readlink -f /bin/zsh)" ]] &&
         [[ -d "/home/$USERNAME/.cache/install-system" ]] &&
-        grep -qxF '%wheel ALL=(ALL:ALL) ALL' /etc/sudoers.d/10-install-system &&
+        grep -qxF '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' /etc/sudoers.d/10-install-system &&
         visudo -cf /etc/sudoers >/dev/null && account_password_is_set root && account_password_is_set "$USERNAME"
 }
 
