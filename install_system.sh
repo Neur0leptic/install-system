@@ -4001,7 +4001,7 @@ elf64_x86_64_is_valid() {
 }
 
 phase_source_apps() {
-    if ! packaged_commands_are_unshadowed cliamp impala nchat wiki-tui croc; then
+    if ! packaged_commands_are_unshadowed nchat wiki-tui croc; then
         request_wait "source-apps needs local executable path conflicts resolved"
         return 0
     fi
@@ -4012,9 +4012,9 @@ phase_source_apps() {
 
 validate_source_apps() {
     validate_policy_sets source-apps &&
-        packaged_commands_are_unshadowed cliamp impala nchat wiki-tui croc || return 1
+        packaged_commands_are_unshadowed nchat wiki-tui croc || return 1
     local command
-    for command in cliamp impala nchat wiki-tui croc; do
+    for command in nchat wiki-tui croc; do
         [[ -x "/usr/bin/$command" ]] || return 1
     done
     required_files check source-apps
