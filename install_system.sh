@@ -44,6 +44,11 @@ readonly PRIVATE_APPLY_POLICY="selected-private-with-transmission-v2"
 readonly GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 readonly SSH_CLIENT_POLICY="etc/ssh/ssh_config.d/00-install-system.conf"
 readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
+# Gentoo packages that later stages or the DWL session cannot do without: when one cannot
+# be installed, the installation stops. Other packages that fail are skipped and listed
+# at the end, and continue retries them. Whole layers outside the application sets
+# (repository tools, hardware, kernel, base system) count as core as well.
+readonly GENTOO_CORE_PACKAGES=" app-admin/chezmoi app-admin/doas app-crypt/gnupg app-eselect/eselect-repository app-misc/jq app-shells/zsh dev-lang/python dev-vcs/git gui-apps/foot gui-wm/dwl media-libs/fontconfig net-misc/curl net-misc/openssh sys-apps/dbus sys-apps/shadow sys-auth/pam_xdg sys-auth/seatd "
 readonly -a HOST_TOOLS=(blkid chroot cmp curl findmnt flock git gpg gpgv lsblk mkfs.f2fs mkfs.vfat mount mountpoint parted partprobe python3 readlink sha256sum sha512sum tar udevadm umount wipefs xz)
 
 
@@ -168,6 +173,9 @@ KERNEL_CHOICE="ask"
 DISK_MODE="erase"
 ACCOUNT_PASSWORD=""
 export -n ACCOUNT_PASSWORD
+# Asked at the start for a new Mullvad device; never written to state, logs or arguments.
+MULLVAD_ACCOUNT=""
+export -n MULLVAD_ACCOUNT
 RESUME_QUESTION_DONE=0
 DRY_RUN=0
 NON_INTERACTIVE=0
@@ -176,6 +184,7 @@ FORCE_STAGE=""
 CHILD_FORCE_STAGE=""
 CURRENT_STAGE=""
 PHASE_WAITING=0
+PHASE_INCOMPLETE=0
 STOP_REQUESTED=0
 RUN_LOCK_FD=""
 STATE_WRITE_ACTIVE=0
@@ -228,7 +237,9 @@ Options:
 Safety:
   --dry-run prints only a phase plan. It never runs phase bodies.
   Choose DELETE_EVERYTHING or SKIP (prepared root and EFI partitions).
-  Passwords, SSH keys and GPG material are never saved in installer state.
+  Passwords, the Mullvad account number and GPG material are never saved in installer
+  state. A GitHub key made at the start of a new installation waits in the root-only
+  installer directory until its account exists.
 EOF
 }
 
@@ -259,7 +270,7 @@ log() {
     case "$*" in
         START\ *) color='1;94'; printf '\n' ;;
         DONE\ *) color='1;92' ;;
-        WAITING\ *) color='1;93' ;;
+        WAITING\ *|INCOMPLETE\ *) color='1;93' ;;
         SKIP\ *|PREREQUISITE\ *) color='0;37' ;;
         *\?) color='1;93' ;; # approval questions
     esac
@@ -325,7 +336,7 @@ root_lock_file_is_safe() {
 }
 
 valid_state_key() {
-    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|kernel|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
+    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|kernel|disk_mode|private_dotfiles|gpg_recipient|wireguard|wireguard_relay|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
 }
 
 valid_state_value() {
@@ -383,7 +394,7 @@ validate_loaded_state() {
         stage="${key#stage.}"
         stage_exists "$stage" || die "unknown stage in state: $stage"
         status="${STATE[$key]}"
-        [[ "$status" =~ ^(pending|running|waiting|failed|done)$ ]] || die "invalid stage state for $stage: $status"
+        [[ "$status" =~ ^(pending|running|waiting|failed|incomplete|done)$ ]] || die "invalid stage state for $stage: $status"
     done
 }
 
@@ -546,6 +557,7 @@ restore_globals_from_state() {
     MACHINE_PROFILE="${STATE[machine]:-generic}"
     set_tier_features
     [[ "$PRIVATE_DOTFILES" != "ask" ]] || PRIVATE_DOTFILES="${STATE[private_dotfiles]:-ask}"
+    [[ -n "$GPG_RECIPIENT" ]] || GPG_RECIPIENT="${STATE[gpg_recipient]:-}"
     ((EFI_OPTION_SET)) || CREATE_EFI_ENTRY="${STATE[efi_entry]:-yes}"
     DISK="${STATE[disk]:-}"
     ROOT_PARTITION="${STATE[root_partition]:-}"
@@ -1079,6 +1091,7 @@ prepare_credentials() {
     [[ "$MODE" == new ]] || return 0
     if ((INTERNAL_CHROOT)) && [[ "${INSTALL_SYSTEM_CREDENTIALS:-}" == 1 ]]; then
         IFS= read -r -d '' ACCOUNT_PASSWORD <&3 || die "credential handoff failed"
+        IFS= read -r -d '' MULLVAD_ACCOUNT <&3 || MULLVAD_ACCOUNT=""
         exec 3<&-
         unset INSTALL_SYSTEM_CREDENTIALS
     fi
@@ -1191,6 +1204,10 @@ show_status() {
     for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
         [[ -z "${STATE["stage.$stage"]:-}" ]] || printf '  %-24s %s\n' "$stage" "${STATE["stage.$stage"]}"
     done
+    if [[ -s "$(missing_packages_file)" ]]; then
+        printf 'Not installed (continue retries them):\n'
+        awk -F '\t' '{printf "  %-24s %s\n", $1, $2}' "$(missing_packages_file)"
+    fi
 }
 
 print_dry_plan() {
@@ -1330,12 +1347,14 @@ run_phase() {
     local name="$1" action="$2" validator="$3" forced="${4:-no}" status
     STOP_REQUESTED=0
     PHASE_WAITING=0
+    PHASE_INCOMPLETE=0
     status="$(state_stage_status "$name")"
 
     if [[ "$forced" != "yes" ]] && "$validator" "$name"; then
         if [[ "$status" != "done" ]]; then
             state_set "stage.$name" "done"
         fi
+        record_missing_packages "$name"
         log "SKIP $name (result already validated)"
         return 0
     fi
@@ -1357,12 +1376,29 @@ run_phase() {
         return 0
     fi
     if ! "$validator" "$name"; then
+        # Packages that could not be installed leave the stage incomplete instead of
+        # stopping the run; continue retries it. Everything else must be in place.
+        if ((PHASE_INCOMPLETE)) && TOLERATE_MISSING=1 "$validator" "$name"; then
+            state_set "stage.$name" "incomplete"
+            CURRENT_STAGE=""
+            log "INCOMPLETE $name (the missing packages are listed at the end)"
+            return 0
+        fi
         state_set "stage.$name" "failed"
         die "postcondition failed for stage: $name"
     fi
+    record_missing_packages "$name"
     state_set "stage.$name" "done"
     CURRENT_STAGE=""
     log "DONE $name"
+}
+
+stage_usable() { # NAME VALIDATOR: done and valid, or incomplete with only uninstallable packages missing
+    case "$(state_stage_status "$1")" in
+        done) "$2" "$1" ;;
+        incomplete) TOLERATE_MISSING=1 "$2" "$1" ;;
+        *) return 1 ;;
+    esac
 }
 
 invalidate_stage_results() {
@@ -1374,8 +1410,10 @@ invalidate_stage_results() {
         if ((invalidate)); then
             STATE["stage.$name"]="pending"
             rm -f -- "/var/lib/install-system/build-passes/$name.json"
+            # A failed world pass keeps its start time, so its retry rebuilds only what is left.
             if [[ "$name" != "$selected" || "$selected_status" == done ]]; then
-                rm -f -- "/var/lib/install-system/build-passes/$name.prepared"
+                rm -f -- "/var/lib/install-system/build-passes/$name.prepared" \
+                    "/var/lib/install-system/build-passes/$name.started"
             fi
         fi
     done
@@ -1401,8 +1439,8 @@ run_sequence() {
         for entry in "$@"; do
             IFS=':' read -r name action validator <<<"$entry"
             [[ "$name" != "$FORCE_STAGE" ]] || break
-            [[ "$(state_stage_status "$name")" == done ]] && "$validator" "$name" || \
-                die "cannot start at $FORCE_STAGE: prerequisite $name is incomplete; resume it after manual repair"
+            stage_usable "$name" "$validator" || \
+                die "cannot start at $FORCE_STAGE: prerequisite $name is unfinished; resume it after manual repair"
         done
         # Retrying a failed pass retains its prepared policy and manual repairs.
         invalidate_stage_results "$FORCE_STAGE" "$selected_status" "$@"
@@ -1415,9 +1453,9 @@ run_sequence() {
         if ((start == 0)); then
             if [[ "$name" != "$FORCE_STAGE" ]]; then
                 status="$(state_stage_status "$name")"
-                [[ "$status" == "done" ]] || die "cannot start at $FORCE_STAGE: prerequisite $name is $status"
-                "$validator" "$name" || die "cannot start at $FORCE_STAGE: prerequisite $name failed validation"
-                log "PREREQUISITE $name (done and validated)"
+                [[ "$status" == done || "$status" == incomplete ]] || die "cannot start at $FORCE_STAGE: prerequisite $name is $status"
+                stage_usable "$name" "$validator" || die "cannot start at $FORCE_STAGE: prerequisite $name failed validation"
+                log "PREREQUISITE $name ($status and validated)"
                 continue
             fi
             [[ "$name" =~ ^(disk|filesystems|mounts|stage3)$ ]] && \
@@ -1966,8 +2004,9 @@ phase_chroot_install() {
     chroot "$TARGET_MOUNT" /usr/bin/env -i \
         HOME=/root TERM="${TERM:-linux}" INSTALL_SYSTEM_CHROOT=1 INSTALL_SYSTEM_CREDENTIALS=1 \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-        /bin/bash /usr/local/sbin/install-system "${CHROOT_ARGS[@]}" 3< <(printf '%s\0' "$ACCOUNT_PASSWORD") || status=$?
+        /bin/bash /usr/local/sbin/install-system "${CHROOT_ARGS[@]}" 3< <(printf '%s\0%s\0' "$ACCOUNT_PASSWORD" "$MULLVAD_ACCOUNT") || status=$?
     ACCOUNT_PASSWORD=""
+    MULLVAD_ACCOUNT=""
     CHROOT_RESULTS_CHECKED=1
     state_load
     ((status == 0)) || return "$status"
@@ -2118,12 +2157,14 @@ run_new_host_sequence() {
     if [[ "$DISTRIBUTION" == arch ]]; then
         arch_host_preflight
         [[ -z "${STATE[root_uuid]:-}" ]] || validate_persisted_devices
+        collect_answers
         run_sequence "${HOST_SEQUENCE[@]}"
         return
     fi
     host_preflight
     ensure_portage_source
     ensure_hardware_plan
+    collect_answers
     run_sequence "${HOST_SEQUENCE[@]}"
 }
 
@@ -2209,6 +2250,12 @@ ensure_hardware_plan() {
         hardware_tool select --plan "$root/inventory.json" --graphics "$GRAPHICS" "${args[@]}" >"$temporary"
         mv -T "$temporary" "$root/inventory.json"
     fi
+    # The firmware choice belongs to the plan; plans made before it existed ask once.
+    if [[ "$DISTRIBUTION" == gentoo ]] && ! hardware_field firmware_list >/dev/null 2>&1; then
+        temporary="$(mktemp "$root/.inventory.XXXXXX")"
+        hardware_tool firmware --plan "$root/inventory.json" "${args[@]}" >"$temporary"
+        mv -T "$temporary" "$root/inventory.json"
+    fi
     if [[ "$DISTRIBUTION" == gentoo ]]; then
         hardware_tool render --plan "$root/inventory.json" --destination "$root/policy" --templates "$NEUROGENTOO_ROOT/config/hardware/templates"
     fi
@@ -2236,24 +2283,75 @@ copy_hardware_state() {
     fi
 }
 
-emerge_with_resources() {
-    local jobs load
+emerge_with_resources() { # [--keep-going] EMERGE-ARGUMENTS
+    local jobs load keep_going=n
+    if [[ "${1:-}" == --keep-going ]]; then keep_going=y; shift; fi
     jobs="$(hardware_field resources.emerge_jobs)" && load="$(hardware_field resources.load)" || die "missing resource budget"
     [[ "$jobs" =~ ^[1-9][0-9]*$ && "$load" =~ ^[1-9][0-9]*$ ]] || die "invalid resource budget"
-    # Override a retained --keep-going default: the first failed build stops the pass.
-    run emerge --jobs="$jobs" --load-average="$load" --keep-going=n "$@"
+    # Otherwise the first failed build stops the pass, even when make.conf sets a
+    # --keep-going default. Callers that keep going judge the result themselves.
+    run emerge --jobs="$jobs" --load-average="$load" --keep-going="$keep_going" "$@"
 }
 
 phase_hardware_policy() {
     ensure_hardware_plan
     deploy_policy_layer hardware/auto/resources
     deploy_policy_layer hardware/auto/minimal
+    retire_versioned_firmware_lists
     install_policy_sets hardware/auto/minimal
+    # A changed list takes effect when the installed linux-firmware version is rebuilt.
+    if firmware_list_outdated; then
+        emerge_with_resources --oneshot "=$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+    fi
 }
 
 validate_hardware_policy() {
     hardware_plan_valid && validate_policy_layer hardware/auto/resources &&
-        validate_policy_sets hardware/auto/minimal
+        validate_policy_sets hardware/auto/minimal &&
+        hardware_field firmware_list >/dev/null 2>&1 && ! firmware_list_outdated
+}
+
+retire_versioned_firmware_lists() {
+    # Portage prefers a list named after the exact version over the plain-named one the
+    # installer deploys, so differing version-specific lists are kept aside as backups.
+    local list=/etc/portage/savedconfig/sys-kernel/linux-firmware path
+    [[ -f "$list" ]] || return 0
+    for path in /etc/portage/savedconfig/sys-kernel/linux-firmware-*; do
+        [[ -f "$path" && "$path" != *.pre-install-system ]] && ! cmp -s "$path" "$list" || continue
+        [[ ! -e "$path.pre-install-system" ]] || die "cannot keep $path aside: $path.pre-install-system already exists"
+        mv -- "$path" "$path.pre-install-system"
+        log "Kept the version-specific firmware list aside: $path.pre-install-system"
+    done
+}
+
+firmware_list_outdated() {
+    # True when the installed linux-firmware was not built from the chosen list: each build
+    # saves the list it used under the package's version name. Listed files that were
+    # deleted since then count as well.
+    local cpv path missing=0 list=/etc/portage/savedconfig/sys-kernel/linux-firmware
+    hardware_field firmware_list 2>/dev/null | grep -q '^\[' || return 1
+    cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+    [[ -n "$cpv" ]] || return 1
+    cmp -s "$list" "/etc/portage/savedconfig/$cpv" || return 0
+    [[ -z "$(installed_firmware_outside_list)" ]] || return 0
+    while IFS= read -r path; do
+        [[ -e "$path" ]] || missing=1
+    done < <(awk '$1 == "obj" && index($2, "/lib/firmware/") == 1 {print $2}' "/var/db/pkg/$cpv/CONTENTS")
+    ((missing))
+}
+
+installed_firmware_outside_list() {
+    # Prints installed linux-firmware files that the chosen firmware list leaves out.
+    local contents
+    hardware_field firmware_list 2>/dev/null | grep -q '^\[' || return 0
+    contents="$(find /var/db/pkg/sys-kernel -maxdepth 2 -path '*/linux-firmware-*/CONTENTS' -print -quit 2>/dev/null)"
+    [[ -n "$contents" ]] || return 0
+    python3 -c 'import json, sys; print(*json.load(open(sys.argv[1]))["firmware_list"], sep="\n")' "$(hardware_root)/inventory.json" |
+        awk 'NR == FNR { keep[$0] = 1; next }
+             ($1 == "obj" || $1 == "sym") && index($2, "/lib/firmware/") == 1 {
+                 name = substr($2, 15); sub(/\.(xz|zst)$/, "", name)
+                 if (!(name in keep)) print name
+             }' - "$contents"
 }
 
 phase_display_config() {
@@ -2484,7 +2582,7 @@ deploy_policy_layer() {
 policy_repair_is_retained() {
     local relative="$1" content="$2" expected previous
     case "$relative" in
-        package.use/*|package.env/*|package.accept_keywords/*|package.mask/*|package.unmask/*|env/*|profile/use.*/*) ;;
+        package.use/*|package.env/*|package.accept_keywords/*|package.mask/*|package.unmask/*|env/*|profile/use.*/*|savedconfig/*) ;;
         *) return 1 ;;
     esac
     # Only retain edits to a previously deployed version of this exact policy.
@@ -2520,11 +2618,8 @@ selected_policy_layers() {
 }
 
 install_policy_sets() {
-    local layer file directory
-    local -a sets=() options=(--update --newuse --select)
-    if [[ -n "${CURRENT_STAGE:-}" && "${FORCE_STAGE:-none}" == "$CURRENT_STAGE" ]]; then
-        options=(--newuse --select)
-    fi
+    local layer file directory atom plan changes
+    local -a sets=() keep_going=(--keep-going) core=() apps=() names=()
     for layer in "$@"; do
         directory="$(policy_layer_directory "$layer")" || die "cannot locate $layer"
         for file in "$directory/sets/"*; do
@@ -2532,9 +2627,150 @@ install_policy_sets() {
             validate_policy_layer "$layer" || die "Portage policy must be deployed before selecting $layer"
             sets+=("@${file##*/}")
         done
+        # Compiler passes stop at the first failure; the later passes build on them.
+        [[ "$layer" != toolchain ]] || keep_going=()
     done
     ((${#sets[@]})) || die "no package sets selected"
-    emerge_with_resources "${options[@]}" "${sets[@]}"
+    # Dependencies are resolved first. A failure there needs a repair and is no failed
+    # build, so it stops the installation with Portage's own explanation.
+    if ! plan="$(emerge --pretend --quiet --color=n --nospinner --changed-use --select "${sets[@]}" 2>&1)"; then
+        printf '%s\n' "$plan" >&2
+        die "Portage could not resolve these packages (see its explanation above); repair that, then continue"
+    fi
+    # An installed package is rebuilt only for the installer's USE flags, but Portage then
+    # takes the newest version its keywords allow. On an existing system that version
+    # change is left to the user instead of being made silently.
+    if [[ "$MODE" == existing ]] && changes="$(grep -E '^\[(ebuild|binary)[^]]*[UD][^]]*\]' <<<"$plan")"; then
+        printf '%s\n' "$changes" >&2
+        die "to apply the installer's USE flags, Portage would change the version of the installed packages above. Rebuild each at the version you want (emerge --oneshot =CATEGORY/PACKAGE-VERSION), then continue"
+    fi
+    # Missing packages are installed and the installer's USE flags applied. Installed
+    # versions are not upgraded: that remains the job of the system's own world update.
+    if emerge_with_resources "${keep_going[@]}" --changed-use --select "${sets[@]}"; then
+        record_missing_packages "$CURRENT_STAGE"
+        return 0
+    fi
+    ((${#keep_going[@]})) || die "the compiler packages did not build (see the emerge output above); repair them, then continue"
+    while IFS=$'\t' read -r layer atom; do
+        if core_package "$layer" "$atom"; then core+=("$atom"); else apps+=("$atom"$'\t'"$layer"); names+=("$atom"); fi
+    done < <(missing_policy_packages "$@")
+    ((${#core[@]} == 0)) ||
+        die "required packages could not be installed: ${core[*]} (see the emerge summary above); repair them, then continue"
+    record_missing_packages "$CURRENT_STAGE" "${apps[@]}"
+    if ((${#apps[@]})); then
+        PHASE_INCOMPLETE=1
+        warn "continuing without ${names[*]}; they are listed again at the end, and continue retries them"
+    else
+        warn "some updates or rebuilds failed; the installed versions remain in use (see the emerge summary above)"
+    fi
+}
+
+missing_policy_packages() { # LAYER...: "LAYER<TAB>ATOM" for every set package that is not installed
+    local layer directory file atom
+    for layer in "$@"; do
+        directory="$(policy_layer_directory "$layer")" || return 1
+        for file in "$directory/sets/"*; do
+            [[ -f "$file" ]] || continue
+            while IFS= read -r atom || [[ -n "$atom" ]]; do
+                [[ -n "$atom" && "$atom" != \#* && "$atom" != @* ]] || continue
+                portageq has_version / "$atom" || printf '%s\t%s\n' "$layer" "$atom"
+            done <"$file"
+        done
+    done
+}
+
+core_package() { # LAYER ATOM: true when the installation cannot go on without it
+    case "$1" in
+        dwl|dwl-apps|full|source-apps|binary-apps|features/*) [[ "$GENTOO_CORE_PACKAGES" == *" $(package_name "$2") "* ]] ;;
+        *) return 0 ;;
+    esac
+}
+
+package_name() { # ATOM: its category/name, without USE dependencies, slot or repository
+    local name="${1%%\[*}"
+    printf '%s' "${name%%:*}"
+}
+
+missing_packages_file() {
+    printf '%s/missing-packages' "$(dirname "$STATE_FILE")"
+}
+
+record_missing_packages() { # STAGE [ATOM<TAB>LAYER...]: replaces the packages STAGE could not install
+    local stage="$1" file kept="" atom
+    shift
+    file="$(missing_packages_file)"
+    if (($# == 0)); then
+        [[ -s "$file" ]] && awk -F '\t' -v stage="$stage" '$1 == stage {found = 1} END {exit !found}' "$file" ||
+            return 0
+    fi
+    [[ ! -s "$file" ]] || kept="$(awk -F '\t' -v stage="$stage" '$1 != stage' "$file")"
+    if [[ -z "$kept" ]] && (($# == 0)); then
+        rm -f -- "$file"
+        return 0
+    fi
+    {
+        [[ -z "$kept" ]] || printf '%s\n' "$kept"
+        for atom in "$@"; do printf '%s\t%s\n' "$stage" "$atom"; done
+    } | write_file "$file" 0644
+}
+
+recorded_missing() { # CATEGORY/NAME: true when a stage could not install it and it is still absent
+    local file stage atom
+    file="$(missing_packages_file)"
+    [[ -s "$file" ]] || return 1
+    while IFS=$'\t' read -r stage atom _; do
+        [[ "$(package_name "$atom")" == "$1" ]] || continue
+        # The recorded atom keeps its USE requirements: a failed rebuild that should add a
+        # flag leaves an older build installed, which still counts as missing.
+        ! portageq has_version / "$atom"
+        return
+    done <"$file"
+    return 1
+}
+
+layer_incomplete() { # LAYER: true when a package of LAYER could not be installed
+    local file
+    file="$(missing_packages_file)"
+    [[ -s "$file" ]] && awk -F '\t' -v layer="$1" '$3 == layer {found = 1} END {exit !found}' "$file"
+}
+
+tolerated() { # CATEGORY/NAME: an uninstallable package is acceptable while validating an incomplete stage
+    [[ "${TOLERATE_MISSING:-0}" == 1 ]] && recorded_missing "$1"
+}
+
+missing_for_stage() { # CATEGORY/NAME...: true, leaving the stage incomplete, when one could not be installed
+    local name
+    for name in "$@"; do
+        recorded_missing "$name" || continue
+        warn "$CURRENT_STAGE needs $name, which could not be installed; continue retries it"
+        PHASE_INCOMPLETE=1
+        return 0
+    done
+    return 1
+}
+
+report_missing_packages() {
+    # Lists what could not be installed, where the build logs are and how to retry.
+    local file stage atom log_file
+    local -a stages=()
+    file="$(missing_packages_file)"
+    for stage in "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
+        [[ "$(state_stage_status "$stage")" != incomplete ]] || stages+=("$stage")
+    done
+    ((${#stages[@]})) || [[ -s "$file" ]] || return 0
+    {
+        printf '\n%s\n' "$(paint yellow 'Not everything could be installed; the installation went on without:')"
+        if [[ -s "$file" ]]; then
+            while IFS=$'\t' read -r stage atom _; do
+                printf '  %s (stage %s)\n' "$(package_name "$atom")" "$stage"
+                for log_file in /var/tmp/portage/"$(package_name "$atom")"-[0-9]*/temp/build.log; do
+                    [[ ! -f "$log_file" ]] || printf '    build log: %s\n' "$log_file"
+                done
+            done <"$file"
+        fi
+        printf 'Incomplete stages: %s\n' "${stages[*]:-none}"
+        printf '%s\n\n' "$(paint yellow "After a repair, continue retries only what is missing: $SCRIPT_PATH continue")"
+    } >&2
 }
 
 validate_policy_sets() {
@@ -2549,7 +2785,7 @@ validate_policy_sets() {
             while IFS= read -r atom || [[ -n "$atom" ]]; do
                 [[ -n "$atom" && "$atom" != \#* ]] || continue
                 [[ "$atom" != @* ]] || return 1
-                portageq has_version / "$atom" || return 1
+                portageq has_version / "$atom" || tolerated "$(package_name "$atom")" || return 1
                 found=1
             done <"$file"
         done
@@ -2653,7 +2889,10 @@ phase_base_packages() {
     emerge_with_resources --oneshot sys-apps/portage app-portage/cpuid2cpuflags
     if ! grep -q '^CPU_FLAGS_X86=' /etc/portage/make.conf; then deploy_policy_layer bootstrap make.conf; fi
     emerge_with_resources --select dev-vcs/git
-    emerge_with_resources --update @world
+    # One failed package does not stop the others; the pass still ends with an error, and
+    # the retry updates only what is left.
+    emerge_with_resources --keep-going --update @world ||
+        die "$CURRENT_STAGE: some packages failed (see the emerge summary above); repair them, then continue"
     run env-update
     record_build_pass 'sys-apps/portage|sys-libs/glibc|sys-devel/gcc|dev-vcs/git'
 }
@@ -2673,6 +2912,7 @@ pass_prepared() {
 record_build_pass() {
     build_state record --stage "$CURRENT_STAGE" --receipt "/var/lib/install-system/build-passes/$CURRENT_STAGE.json" \
         --pattern "${1:-llvm|rust}"
+    rm -f -- "/var/lib/install-system/build-passes/$CURRENT_STAGE.started"
 }
 
 validate_build_pass() {
@@ -2686,9 +2926,40 @@ phase_bootstrap_world() {
         state_set compiler_policy bootstrap
         mark_pass_prepared
     fi
-    emerge_with_resources -e --newuse --update @world
+    rebuild_world
     emerge_with_resources --depclean
     record_build_pass 'sys-apps/portage|sys-libs/glibc|sys-devel/gcc'
+}
+
+rebuild_world() { # [EXCLUDED-PACKAGES]: one "emerge -e @world" pass of the compiler bootstrap
+    # A failed package does not stop the others, but the pass ends with an error so the
+    # failure is repaired before the next pass. The retry skips what it already rebuilt.
+    local started="/var/lib/install-system/build-passes/$CURRENT_STAGE.started" excluded="${1:-}"
+    local -a arguments=(--keep-going --update --newuse -e @world)
+    if [[ -s "$started" ]]; then
+        excluded+=" $(packages_built_since "$(cat "$started")" | tr '\n' ' ')"
+    else
+        date +%s | write_file "$started" 0600
+    fi
+    [[ -z "${excluded// /}" ]] || arguments+=(--exclude "$excluded")
+    # The start time stays until record_build_pass completes the stage, so a later
+    # failure (such as depclean) does not restart the whole pass.
+    emerge_with_resources "${arguments[@]}" ||
+        die "$CURRENT_STAGE: some packages failed (see the emerge summary above); repair them, then continue to rebuild only what is left"
+}
+
+packages_built_since() { # EPOCH: slot atoms of the installed packages built at or after EPOCH
+    python3 - "$1" <<'PY'
+import sys
+
+import portage
+
+db = portage.db['/']['vartree'].dbapi
+for cpv in db.cpv_all():
+    stamp, slot = db.aux_get(cpv, ['BUILD_TIME', 'SLOT'])
+    if stamp.isdigit() and int(stamp) >= int(sys.argv[1]):
+        print(portage.cpv_getkey(cpv) + ':' + slot.split('/')[0])
+PY
 }
 
 phase_toolchain_bootstrap() {
@@ -2712,7 +2983,7 @@ phase_prepolly_world() {
         state_set compiler_policy prepolly
         mark_pass_prepared
     fi
-    emerge_with_resources --update --newuse -e @world
+    rebuild_world
     emerge_with_resources --depclean
     record_build_pass
 }
@@ -2827,7 +3098,7 @@ phase_world_rebuild() {
     local excluded
     excluded="$(build_state list --pattern 'llvm|rust|glibc|gcc|binutils')"
     excluded="${excluded//$'\n'/ }"
-    emerge_with_resources --update --newuse -e @world --exclude "$excluded"
+    rebuild_world "$excluded"
     record_build_pass 'sys-apps/portage|sys-libs/glibc|sys-devel/gcc|llvm|rust'
 }
 
@@ -2864,6 +3135,13 @@ system_policy_services() {
     while read -r service runlevel extra; do
         [[ -n "$service" && "$service" != \#* ]] || continue
         [[ "$service" =~ ^[a-zA-Z0-9_.-]+$ && "$runlevel" =~ ^[a-zA-Z0-9_-]+$ && -z "$extra" ]] || return 1
+        # A service whose package could not be installed waits until continue retries it.
+        # An installed package that lost its service script is still an error.
+        if [[ "$service" != agetty.tty* && ! -e "/etc/init.d/$service" ]] &&
+            { ((PHASE_INCOMPLETE)) || [[ "${TOLERATE_MISSING:-0}" == 1 ]]; } && layer_incomplete "$layer" &&
+            ! portageq owners / "/etc/init.d/$service" >/dev/null 2>&1; then
+            continue
+        fi
         if [[ "$action" == apply ]]; then
             if [[ "$service" == agetty.tty* && ! -e "/etc/init.d/$service" && ! -L "/etc/init.d/$service" ]]; then
                 ln -s agetty "/etc/init.d/$service"
@@ -3231,15 +3509,18 @@ validate_boot() {
 phase_marker() {
     local marker="/var/lib/install-system/$CURRENT_STAGE"
     printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$marker"
+    report_missing_packages
 }
 
 stage_group_complete_before() {
+    # Stages left incomplete by packages that could not be installed do not hold up the
+    # tier; continue retries them.
     local stop="$1" stage status
     shift
     for stage in "$@"; do
         [[ "$stage" == "$stop" ]] && return 0
         status="$(state_stage_status "$stage")"
-        [[ "$status" == "done" ]] || return 1
+        [[ "$status" == done || "$status" == incomplete ]] || return 1
     done
     return 1
 }
@@ -3408,7 +3689,12 @@ phase_desktop_packages() {
     local group groups="" separator="" policy_groups
     policy_groups="$(system_policy_groups dwl)" && [[ -n "$policy_groups" ]] || die "missing desktop account groups"
     for group in $policy_groups; do
-        getent group "$group" >/dev/null || die "required desktop group is missing: $group"
+        if ! getent group "$group" >/dev/null; then
+            # The group's acct-group package came with an application that could not be
+            # installed; continue retries it. A group missing despite its package is an error.
+            ((PHASE_INCOMPLETE == 0)) || ! layer_incomplete dwl || portageq has_version / "acct-group/$group" || continue
+            die "required desktop group is missing: $group"
+        fi
         groups+="$separator$group"
         separator=,
     done
@@ -3435,7 +3721,11 @@ validate_desktop_packages() {
     required_files check "${POLICY_LAYERS[@]}" || return 1
     groups=" $(id -nG "$USERNAME") " || return 1
     policy_groups="$(system_policy_groups dwl)" && [[ -n "$policy_groups" ]] || return 1
-    for group in $policy_groups; do [[ "$groups" == *" $group "* ]] || return 1; done
+    for group in $policy_groups; do
+        [[ "$groups" == *" $group "* ]] ||
+            { [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete dwl && ! getent group "$group" >/dev/null &&
+                ! portageq has_version / "acct-group/$group"; } || return 1
+    done
     system_policy_services check dwl && system_policy check dwl etc/pam.d/system-login &&
         { ssh_client_reads_rsa || system_policy check dwl "$SSH_CLIENT_POLICY"; }
 }
@@ -3597,11 +3887,10 @@ public_dotfiles_revision() {
 }
 
 validate_dwl_packaged_apps() {
+    # The layer's required files list these executables.
     validate_policy_sets dwl-apps &&
         packaged_commands_are_unshadowed dwl yazi ya clipse timer ripdrag wayland-pipewire-idle-inhibit unimatrix &&
-        [[ -x /usr/bin/dwl && -x /usr/bin/yazi && -x /usr/bin/ya && -x /usr/bin/clipse &&
-           -x /usr/bin/timer && -x /usr/bin/ripdrag && -x /usr/bin/wayland-pipewire-idle-inhibit &&
-           -x /usr/bin/unimatrix ]] &&
+        [[ -x /usr/bin/dwl ]] &&
         required_files check dwl-apps
 }
 
@@ -3689,7 +3978,8 @@ PY
         --promptBool 'Enable Hermes integrations=false'
     run_as_user dbus-run-session -- \
         chezmoi --source "$source" --config "$config" --no-tty apply
-    if [[ ! -s "$yazi_mount_plugin" ]]; then
+    # Yazi's own package manager installs its plugins; without Yazi that waits for continue.
+    if [[ ! -s "$yazi_mount_plugin" ]] && ! missing_for_stage app-misc/yazi; then
         run_as_user env \
             GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false GCM_INTERACTIVE=never \
             GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=protocol.version GIT_CONFIG_VALUE_0=1 \
@@ -3733,7 +4023,7 @@ validate_public_dotfiles() {
         validate_desktop_dotfiles && validate_shell_theme_dotfiles &&
         [[ -x "$home/.local/bin/waybar_toggle.sh" ]] &&
         [[ -x "$home/.local/bin/recorder.sh" ]] &&
-        [[ -s "$home/.config/yazi/plugins/mount.yazi/sudo.lua" ]] &&
+        { tolerated app-misc/yazi || [[ -s "$home/.config/yazi/plugins/mount.yazi/sudo.lua" ]]; } &&
         cmp -s "$source/dot_local/bin/executable_waybar_toggle.sh" "$home/.local/bin/waybar_toggle.sh" &&
         [[ -s "$home/.local/share/icons/candy-icons/index.theme" ]] &&
         [[ -s "$home/.config/zsh/powerlevel10k/powerlevel10k.zsh-theme" ]] &&
@@ -3778,6 +4068,7 @@ validate_librewolf_setup_outputs() {
 
 phase_librewolf_setup() {
     local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" result answer
+    ! missing_for_stage www-client/librewolf || return 0
     [[ -x "$script" ]] || die "managed LibreWolf setup script is missing"
     if [[ "${STATE[librewolf_setup_result]:-}" == failed && "${FORCE_STAGE:-}" != librewolf-setup ]]; then
         if validate_librewolf_setup_outputs && ((NON_INTERACTIVE == 0)); then
@@ -3810,11 +4101,13 @@ phase_librewolf_setup() {
 }
 
 validate_librewolf_setup() {
+    tolerated www-client/librewolf && return 0
     [[ "${STATE[librewolf_setup_result]:-}" == success ]] && validate_librewolf_setup_outputs
 }
 
 phase_browser_theme() {
     local helper="/home/$USERNAME/.local/bin/setup_browser_theme.sh"
+    ! missing_for_stage www-client/librewolf www-client/helium-bin || return 0
     [[ -x "$helper" ]] || die "managed browser-theme helper is missing"
     if ! run_as_user "$helper" --apply; then
         request_wait "browser theme setup needs review; existing differing CSS and active Helium profiles are preserved"
@@ -3825,6 +4118,7 @@ phase_browser_theme() {
 
 validate_browser_theme() {
     local helper="/home/$USERNAME/.local/bin/setup_browser_theme.sh"
+    tolerated www-client/librewolf || tolerated www-client/helium-bin && return 0
     [[ -x "$helper" ]] && run_as_user "$helper" --check
 }
 
@@ -3840,6 +4134,7 @@ browser_extension_policies() {
 }
 
 phase_browser_extensions() {
+    ! missing_for_stage www-client/librewolf || return 0
     if ! browser_extension_policies apply; then
         request_wait "browser extension policies need review; conflicting settings are preserved"
         return 0
@@ -3849,6 +4144,7 @@ phase_browser_extensions() {
 }
 
 validate_browser_extensions() {
+    tolerated www-client/librewolf && return 0
     browser_extension_policies check
 }
 
@@ -3948,7 +4244,8 @@ create_github_ssh_key() {
     while :; do
         read -r -p 'Press Enter once GitHub lists the key, or type later to pause: ' answer </dev/tty
         if [[ "$answer" == later ]]; then
-            request_wait "add $key.pub to GitHub, then continue"
+            # Outside a stage there is nothing to pause; the private-dotfiles stage asks again.
+            [[ -z "${CURRENT_STAGE:-}" ]] || request_wait "add $key.pub to GitHub, then continue"
             return 1
         fi
         run_as_user env "GIT_SSH_COMMAND=$ssh_command" git ls-remote "$PRIVATE_DOTFILES_URL" HEAD >/dev/null 2>&1 && return 0
@@ -3982,6 +4279,7 @@ EOF
     rm -f "$marker"
     rm -f /var/lib/install-system/private-dotfiles.applied
     ensure_github_known_host
+    install_github_key_from_start
 
     if [[ -z "$SSH_KEY" ]] && private_ssh_key_is_safe "$home/.ssh/id_ed25519_github"; then
         SSH_KEY="$home/.ssh/id_ed25519_github"
@@ -4100,6 +4398,7 @@ validate_private_dotfiles() {
 phase_wireguard() {
     local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard" identity
     local skipped=/var/lib/install-system/wireguard.skipped
+    ! missing_for_stage net-vpn/wireguard-tools net-firewall/nftables || return 0
     [[ -x "$repo/bin/wireguard.sh" && -s "$repo/libexec/wireguard-dns.sh" ]] ||
         die "the WireGuard scripts are missing; repeat the full-public-dotfiles stage"
     install -d -m 0700 /etc/wireguard
@@ -4110,11 +4409,25 @@ phase_wireguard() {
             ln -sfn -- "$home/.config/wireguard/device.json" /etc/wireguard/device.json
             [[ ! -e "$home/.config/wireguard/default-relay" ]] ||
                 ln -sfn -- "$home/.config/wireguard/default-relay" /etc/wireguard/default-relay
-        elif identity="$(private_wireguard_identity)"; then
-            install_private_wireguard_identity "$identity"
-        elif ! register_mullvad_device; then
-            printf 'no Mullvad device registered\n' | write_file "$skipped" 0644
-            return 0
+        else
+            # The VPN was chosen at the start of the installation.
+            case "${STATE[wireguard]:-none}" in
+                identity:*)
+                    identity="${STATE[wireguard]#identity:}"
+                    if ! private_wireguard_identities | grep -qxF -- "$identity"; then
+                        unset 'STATE[wireguard]'
+                        state_write
+                        request_wait "the private dotfiles have no WireGuard identity \"$identity\"; continue asks again"
+                        return 0
+                    fi
+                    install_private_wireguard_identity "$identity"
+                    ;;
+                mullvad) register_mullvad_device || return 0 ;;
+                *)
+                    printf 'no WireGuard VPN chosen\n' | write_file "$skipped" 0644
+                    return 0
+                    ;;
+            esac
         fi
     fi
     rm -f -- "$skipped"
@@ -4131,24 +4444,16 @@ phase_wireguard() {
     fi
 }
 
-private_wireguard_identity() {
-    # Prints the identity from the private dotfiles that the user confirms for this
-    # computer. Each identity is one Mullvad device and works on one computer only.
-    local source="/home/$USERNAME/.local/share/chezmoi-private/dot_config/wireguard" file name answer
-    ((NON_INTERACTIVE == 0)) && [[ "${STATE[private_dotfiles]:-}" == yes ]] || return 1
-    for file in "$source"/encrypted_private_device-*.json.asc; do
+private_wireguard_identities() {
+    # Names of the WireGuard identities in the private dotfiles; each one is a Mullvad
+    # device and works on one computer only.
+    local file name
+    for file in "/home/$USERNAME/.local/share/chezmoi-private/dot_config/wireguard"/encrypted_private_device-*.json.asc; do
         [[ -f "$file" && ! -L "$file" ]] || continue
         name="${file##*/encrypted_private_device-}"
         name="${name%.json.asc}"
-        [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-        printf '\n%s\n' "$(paint yellow "Your private dotfiles contain the WireGuard identity \"$name\"; an identity works on one computer only.")" >/dev/tty
-        read -r -p "$(paint yellow "Was \"$name\" made for this computer? [y/N] ")" answer </dev/tty
-        if [[ "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
-            printf '%s\n' "$name"
-            return 0
-        fi
+        [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]] || printf '%s\n' "$name"
     done
-    return 1
 }
 
 install_private_wireguard_identity() { # NAME
@@ -4171,18 +4476,17 @@ install_private_wireguard_identity() { # NAME
 register_mullvad_device() {
     # Registers this machine as a new device of the user's Mullvad account. The account
     # number, access token and private key never reach logs, state or command lines.
-    local account token response private name ipv4 ipv6 relay
-    ((NON_INTERACTIVE == 0)) || return 1
-    printf '\n%s\n' "$(paint yellow $'WireGuard: register this machine as a new device of your Mullvad account (an\naccount allows five devices). Leave the account number empty to skip the VPN.')" >/dev/tty
-    IFS= read -r -s -p 'Mullvad account number: ' account </dev/tty
-    printf '\n' >/dev/tty
-    account="${account//[[:space:]]/}"
-    [[ -n "$account" ]] || return 1
+    local account="$MULLVAD_ACCOUNT" token response private name ipv4 ipv6 relay="${STATE[wireguard_relay]:-}"
+    if [[ -z "$account" ]]; then
+        request_wait "the Mullvad account number is asked at the start of an interactive continue"
+        return 1
+    fi
     [[ "$account" =~ ^[0-9]{16}$ ]] || die "a Mullvad account number has 16 digits"
     token="$(printf '{"account_number":"%s"}' "$account" |
         curl -fsS -H 'Content-Type: application/json' --data @- https://api.mullvad.net/auth/v1/token |
         jq -r '.access_token // empty')" || token=""
     account=""
+    MULLVAD_ACCOUNT=""
     [[ -n "$token" ]] || die "Mullvad did not accept the account number"
     private="$(wg genkey)"
     response="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
@@ -4204,16 +4508,13 @@ register_mullvad_device() {
         write_file /etc/wireguard/device.json 0600
     private=""
     log "Registered the Mullvad device \"$name\" for this machine."
-    read -r -p 'Server for automatic connection, such as se-got-wg-001 (empty = choose in the menu): ' relay </dev/tty
-    if [[ -n "$relay" ]]; then
-        [[ "$relay" =~ ^[a-z]{2}-[a-z]{3}-wg-[0-9]{3}$ ]] || die "not a Mullvad WireGuard server name: $relay"
-        printf '%s\n' "$relay" | write_file /etc/wireguard/default-relay 0600
-    fi
+    [[ -z "$relay" ]] || printf '%s\n' "$relay" | write_file /etc/wireguard/default-relay 0600
 }
 
 validate_wireguard() {
     local services
     [[ ! -s /var/lib/install-system/wireguard.skipped ]] || return 0
+    tolerated net-vpn/wireguard-tools || tolerated net-firewall/nftables && return 0
     [[ -e /etc/wireguard/device.json && -x /usr/local/bin/wireguard.sh && -x /usr/local/bin/wireguard-dns.sh ]] ||
         return 1
     if [[ "$DISTRIBUTION" == arch ]]; then
@@ -4251,17 +4552,20 @@ validate_full_packages() {
     required_files check "${POLICY_LAYERS[@]}" || return 1
     [[ "$TORRENT" != yes ]] || system_policy check torrent etc/init.d/flaresolverr || return 1
     local command encoders
-    # Read the whole list first: grep -q closing the pipe early makes ffmpeg exit
-    # with SIGPIPE, which pipefail reports as a failed check.
-    encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)" || return 1
-    for command in aac libopus libx264; do
-        grep -qw "$command" <<<"$encoders" || return 1
-    done
-    if hardware_field graphics.families | grep -q nvidia; then
-        grep -qw h264_nvenc <<<"$encoders" || return 1
+    if ! tolerated media-video/ffmpeg; then
+        # Read the whole list first: grep -q closing the pipe early makes ffmpeg exit
+        # with SIGPIPE, which pipefail reports as a failed check.
+        encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)" || return 1
+        for command in aac libopus libx264; do
+            grep -qw "$command" <<<"$encoders" || return 1
+        done
+        if hardware_field graphics.families | grep -q nvidia; then
+            grep -qw h264_nvenc <<<"$encoders" || return 1
+        fi
     fi
-    tesseract --list-langs 2>/dev/null | grep -qx deu || return 1
-    [[ "$FEATURE_KEEPASS" != "true" ]] || python -c 'import pykeepass' >/dev/null 2>&1 || return 1
+    tolerated app-text/tesseract || tesseract --list-langs 2>/dev/null | grep -qx deu || return 1
+    [[ "$FEATURE_KEEPASS" != "true" ]] || tolerated dev-python/pykeepass ||
+        python -c 'import pykeepass' >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -4283,13 +4587,10 @@ phase_source_apps() {
 }
 
 validate_source_apps() {
+    # The layer's required files list the nchat, wiki-tui and croc executables.
     validate_policy_sets source-apps &&
-        packaged_commands_are_unshadowed nchat wiki-tui croc || return 1
-    local command
-    for command in nchat wiki-tui croc; do
-        [[ -x "/usr/bin/$command" ]] || return 1
-    done
-    required_files check source-apps
+        packaged_commands_are_unshadowed nchat wiki-tui croc &&
+        required_files check source-apps
 }
 
 packaged_commands_are_unshadowed() {
@@ -4323,9 +4624,18 @@ required_files() {
                     continue
                 fi
             fi
-            [[ "$action" == repair ]] || return 1
+            # Files of a package that could not be installed have no installed owner. They
+            # are acceptable only while the stage is incomplete; continue retries it.
+            if [[ "$action" == check ]]; then
+                [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete "$layer" &&
+                    ! portageq owners / "$path" >/dev/null 2>&1 && continue
+                return 1
+            fi
             # Ask Portage for the owning package, even when its installed file is missing.
-            owners="$(portageq owners / "$path")" || die "no installed package owns required output: $path"
+            if ! owners="$(portageq owners / "$path")"; then
+                ((PHASE_INCOMPLETE == 0)) || ! layer_incomplete "$layer" || continue
+                die "no installed package owns required output: $path"
+            fi
             while IFS= read -r cpv; do
                 [[ "$cpv" =~ ^[a-zA-Z0-9+_.-]+/[a-zA-Z0-9+_.-]+$ ]] || continue
                 repair["=$cpv"]=1
@@ -4334,7 +4644,7 @@ required_files() {
     done
     ((found)) || return 1
     if ((${#repair[@]})); then emerge_with_resources --oneshot "${!repair[@]}"; fi
-    [[ "$action" != repair ]] || required_files check "$@"
+    [[ "$action" != repair ]] || TOLERATE_MISSING="$PHASE_INCOMPLETE" required_files check "$@"
 }
 
 phase_binary_apps() {
@@ -4348,13 +4658,11 @@ phase_binary_apps() {
 }
 
 validate_binary_apps() {
+    # The layer's required files cover the executables and their ELF format under /usr/bin.
     validate_policy_sets binary-apps &&
         packaged_commands_are_unshadowed opencode shfmt localsend &&
-        [[ -x /usr/bin/opencode && -x /usr/bin/shfmt && -x /usr/bin/localsend ]] &&
-        elf64_x86_64_is_valid /usr/bin/opencode &&
-        elf64_x86_64_is_valid /usr/bin/shfmt &&
-        elf64_x86_64_is_valid /opt/localsend/localsend_app &&
-        required_files check binary-apps
+        required_files check binary-apps &&
+        { tolerated net-misc/localsend-bin || elf64_x86_64_is_valid /opt/localsend/localsend_app; }
 }
 
 validate_full_complete() {
@@ -4481,6 +4789,196 @@ apply_runtime_overrides() {
     fi
 }
 
+collect_answers() {
+    # Every question of the chosen tier is asked here, at the start, and recorded; the
+    # stages then run without asking. Secrets stay in memory and are asked again when a
+    # later run still needs them.
+    ((DRY_RUN == 0)) || return 0
+    record_tier_approvals
+    ((NON_INTERACTIVE == 0)) && [[ "$TIER" != minimal ]] || return 0
+    if [[ "$TIER" == full && "$TORRENT" == ask ]]; then
+        select_torrent
+        state_set torrent "$TORRENT"
+    fi
+    if [[ "$DISTRIBUTION" == arch ]]; then arch_prepare_hardware; else ensure_hardware_plan; fi
+    collect_display_answers
+    collect_shell_answer
+    if private_dotfiles_requested; then collect_private_answers; fi
+    [[ "$TIER" != full ]] || collect_wireguard_answers
+}
+
+record_tier_approvals() {
+    # Choosing a tier approves its transitions, so no stage asks for them later.
+    local approval
+    local -a approvals=()
+    case "$DISTRIBUTION/$TIER" in
+        gentoo/dwl) approvals=(minimal-to-dwl) ;;
+        gentoo/full) approvals=(minimal-to-dwl dwl-to-full) ;;
+        arch/desktop) approvals=(minimal-to-desktop) ;;
+        arch/full) approvals=(minimal-to-desktop desktop-to-full) ;;
+    esac
+    for approval in "${approvals[@]}"; do STATE["approval.$approval"]=yes; done
+    ((${#approvals[@]} == 0)) || state_write
+}
+
+account_exists() {
+    getent passwd "$USERNAME" >/dev/null && [[ -d "/home/$USERNAME" ]]
+}
+
+collect_display_answers() {
+    # The display-config stage later finds these answers and only validates them.
+    local root
+    root="$(hardware_root)"
+    [[ -z "$DISPLAY_CONFIG" && ! -f "$root/displays.json" && ! -f "$root/display-input.json" ]] || return 0
+    if account_exists; then
+        phase_display_config
+    else
+        display_answers_before_account
+    fi
+}
+
+display_answers_before_account() {
+    # A new installation asks before its account exists: the presets come straight from
+    # the public dotfiles, and the answers move to the target with the hardware plan.
+    local root presets temporary repository="${PUBLIC_DOTFILES_URL#https://github.com/}"
+    local -a args=()
+    root="$(hardware_root)"
+    presets="$root/machinePresets.json"
+    if curl -fsSL --max-time 60 -o "$presets" \
+        "https://raw.githubusercontent.com/${repository%.git}/$PUBLIC_DOTFILES_BRANCH/.chezmoidata/machinePresets.json"; then
+        args+=(--presets "$presets")
+    else
+        rm -f -- "$presets"
+        warn "the machine presets could not be downloaded; the display questions have no saved suggestions"
+    fi
+    [[ "$USERNAME" != neuroleptic || "$PRIVATE_DOTFILES" == no ]] || args+=(--wireguard-profiles)
+    [[ "$DESKTOP" != hyprland ]] || args+=(--desktop hyprland)
+    temporary="$(mktemp "$root/.displays.XXXXXX")"
+    if ! python3 "$COMMON_DATA/displays.py" --inventory "$root/inventory.json" "${args[@]}" >"$temporary"; then
+        rm -f -- "$temporary" "$presets"
+        die "display configuration was not saved"
+    fi
+    mv -T -- "$temporary" "$root/displays.json"
+    rm -f -- "$presets"
+}
+
+collect_shell_answer() {
+    # The desktop needs Zsh; an existing account changes its shell only with approval.
+    local current answer
+    [[ "$MODE" == existing && "${STATE[approval.user-shell]:-}" != yes ]] && account_exists || return 0
+    current="$(getent passwd "$USERNAME" | cut -d: -f7)"
+    [[ "$(readlink -f "$current")" != "$(readlink -f /bin/zsh)" ]] || return 0
+    read -r -p "$(paint yellow "The desktop uses Zsh. Change $USERNAME's shell from $current to Zsh? [y/N] ")" answer </dev/tty
+    [[ "$answer" =~ ^[yY]([eE][sS])?$ ]] || die "Zsh is required for the desktop; the shell of $USERNAME stays as it is"
+    state_set approval.user-shell yes
+}
+
+collect_private_answers() {
+    # The private dotfiles need the fingerprint of their GPG key and a GitHub SSH key of
+    # this machine; both are settled now.
+    local fingerprint
+    if [[ -z "$GPG_RECIPIENT" ]] && account_exists; then GPG_RECIPIENT="$(detect_gpg_recipient || true)"; fi
+    if [[ -z "$GPG_RECIPIENT" ]]; then
+        read -r -p 'Fingerprint of the GPG key that encrypts your private dotfiles (40 hex digits): ' fingerprint </dev/tty
+        fingerprint="${fingerprint//[[:space:]]/}"
+        [[ "$fingerprint" =~ ^[0-9A-Fa-f]{40}$ ]] || die "a GPG fingerprint has 40 hex digits"
+        GPG_RECIPIENT="${fingerprint^^}"
+    fi
+    [[ "${STATE[gpg_recipient]:-}" == "$GPG_RECIPIENT" ]] || state_set gpg_recipient "$GPG_RECIPIENT"
+    if account_exists; then
+        # A key made at the start of a new installation is this machine's key.
+        if [[ -f "$(github_key_handoff)/id_ed25519_github" ]]; then
+            ensure_github_known_host
+            install_github_key_from_start
+        fi
+        [[ -z "$SSH_KEY" ]] && ! private_ssh_key_is_safe "/home/$USERNAME/.ssh/id_ed25519_github" &&
+            ! run_as_user ssh-add -l >/dev/null 2>&1 || return 0
+        ensure_github_known_host
+        create_github_ssh_key || true
+    elif [[ ! -f "$(github_key_handoff)/id_ed25519_github" ]]; then
+        create_github_ssh_key_before_account
+    fi
+}
+
+github_key_handoff() {
+    printf '%s/github-key' "$(hardware_root)"
+}
+
+create_github_ssh_key_before_account() {
+    # The account does not exist yet, so the key waits next to the hardware plan, moves
+    # to the target with it, and private-dotfiles installs it into the account.
+    local handoff key known_hosts label="$USERNAME@$HOSTNAME_VALUE" ssh_command answer
+    handoff="$(github_key_handoff)"
+    key="$handoff/id_ed25519_github"
+    known_hosts="$handoff/known_hosts"
+    require_command ssh-keygen
+    install -d -m 0700 "$handoff"
+    ssh-keygen -q -t ed25519 -N '' -C "$label" -f "$key" </dev/null || die "could not create $key"
+    printf '%s\n' "$GITHUB_SSH_HOST_KEY" | write_file "$known_hosts" 0644
+    printf -v ssh_command 'ssh -i %q -o IdentitiesOnly=yes -o BatchMode=yes -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q' \
+        "$key" "$known_hosts"
+    printf '\n%s\n\n%s\n\n' "$(paint yellow "Add the new SSH key of this machine at https://github.com/settings/ssh/new (title: $label):")" \
+        "$(paint cyan "$(cat -- "$key.pub")")" >/dev/tty
+    while :; do
+        read -r -p 'Press Enter once GitHub lists the key, or type later to add it during the installation: ' answer </dev/tty
+        [[ "$answer" != later ]] || return 0
+        env "GIT_SSH_COMMAND=$ssh_command" GIT_TERMINAL_PROMPT=0 git ls-remote "$PRIVATE_DOTFILES_URL" HEAD >/dev/null 2>&1 && return 0
+        printf 'GitHub does not accept the key yet.\n' >/dev/tty
+    done
+}
+
+install_github_key_from_start() {
+    # A key created at the start of a new installation moves into the account.
+    local handoff key="/home/$USERNAME/.ssh/id_ed25519_github" group
+    handoff="$(github_key_handoff)"
+    [[ -f "$handoff/id_ed25519_github" && ! -e "$key" && ! -L "$key" ]] || return 0
+    group="$(id -gn "$USERNAME")" || die "cannot resolve the group of $USERNAME"
+    install -o "$USERNAME" -g "$group" -m 0600 "$handoff/id_ed25519_github" "$key"
+    install -o "$USERNAME" -g "$group" -m 0644 "$handoff/id_ed25519_github.pub" "$key.pub"
+    rm -rf -- "$handoff"
+}
+
+collect_wireguard_answers() {
+    # The VPN of this machine is chosen now; the WireGuard stage acts on the answer.
+    local choice name relay account
+    local -a options=('Register this computer as a new device of my Mullvad account') identities=()
+    if [[ ! -v STATE[wireguard] && ! -e /etc/wireguard/device.json ]]; then
+        if private_dotfiles_requested; then
+            options+=('Use a WireGuard identity from my private dotfiles made for this computer')
+        fi
+        options+=('No VPN')
+        printf '%s\n' 'WireGuard VPN: a Mullvad account allows five devices, and an identity works on one computer only.' >/dev/tty
+        choice="$(choose_number 'VPN' "${options[@]}")"
+        case "$choice" in
+            Register*)
+                STATE[wireguard]=mullvad
+                read -r -p 'Server for automatic connection, such as se-got-wg-001 (empty = choose in the menu): ' relay </dev/tty
+                [[ -z "$relay" || "$relay" =~ ^[a-z]{2}-[a-z]{3}-wg-[0-9]{3}$ ]] || die "not a Mullvad WireGuard server name: $relay"
+                [[ -z "$relay" ]] || STATE[wireguard_relay]="$relay"
+                ;;
+            Use*)
+                mapfile -t identities < <(private_wireguard_identities)
+                if ((${#identities[@]})); then
+                    name="$(choose_number 'WireGuard identity' "${identities[@]}")"
+                else
+                    read -r -p 'Name of the identity in your private dotfiles, such as main: ' name </dev/tty
+                fi
+                [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid WireGuard identity name: $name"
+                STATE[wireguard]="identity:$name"
+                ;;
+            *) STATE[wireguard]=none ;;
+        esac
+        state_write
+    fi
+    if [[ "${STATE[wireguard]:-}" == mullvad && -z "$MULLVAD_ACCOUNT" && "$(state_stage_status wireguard)" != done ]]; then
+        IFS= read -r -s -p 'Mullvad account number (used once, never stored): ' account </dev/tty
+        printf '\n' >/dev/tty
+        account="${account//[[:space:]]/}"
+        [[ "$account" =~ ^[0-9]{16}$ ]] || die "a Mullvad account number has 16 digits"
+        MULLVAD_ACCOUNT="$account"
+    fi
+}
+
 run_target_install() {
     prepare_credentials
     if [[ "$DISTRIBUTION" == arch ]]; then arch_run_target; return; fi
@@ -4491,6 +4989,7 @@ run_target_install() {
     set_tier_features
     ensure_portage_source
     [[ "$MODE" != new ]] || ensure_hardware_plan
+    collect_answers
     local -a sequence=()
     if [[ "$MODE" == "new" ]]; then
         sequence+=("${MINIMAL_SEQUENCE[@]}")
@@ -5693,6 +6192,7 @@ arch_run_target() {
     ensure_arch_source
     if [[ "$MODE" == existing || "$(state_stage_status accounts)" == done ]]; then select_existing_user; fi
     set_tier_features
+    collect_answers
     local -a sequence=()
     if [[ "$MODE" == new ]]; then sequence+=("${MINIMAL_SEQUENCE[@]}"); else sequence+=("${EXISTING_SEQUENCE[@]}"); fi
     sequence+=("${DWL_SEQUENCE[@]}" "${FULL_SEQUENCE[@]}")

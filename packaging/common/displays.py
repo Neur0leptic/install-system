@@ -145,28 +145,35 @@ def split_tags(count):
     return groups
 
 
-def arrange(selected, detected, saved, read, report):
+def arrange(selected, modes, saved, read, report):
     # Each display is placed beside the previous one; the pixel positions follow from the
     # answers, using the size the display has after scaling.
     report('Arrangement (where the displays stand on your desk):')
-    sides = []
+    sides, suggestions = [], []
     for previous, current in zip(selected, selected[1:]):
         suggested = side_of(current, previous)
         answer = read(f'Where is {current["name"]} relative to {previous["name"]}? left, right, above or below [{suggested}]: ') or suggested
         if answer not in SIDES:
             raise ValueError(f'answer left, right, above or below for {current["name"]}')
         sides.append(answer)
-    sizes = []
-    for output, known in zip(selected, detected):
-        width, height = mode_size(output['mode'], known.get('modes', [])) or (0, 0)
-        sizes.append((round(width / output['scale']), round(height / output['scale'])))
-    positions = [(0, 0)]
-    for side, (pw, ph), (cw, ch) in zip(sides, sizes, sizes[1:]):
-        x, y = positions[-1]
-        positions.append({'left': (x - cw, y), 'right': (x + pw, y), 'above': (x, y - ch), 'below': (x, y + ph)}[side])
-    left, top = min(x for x, _ in positions), min(y for _, y in positions)
-    for output, (x, y) in zip(selected, positions):
-        output['position'] = f'{x - left},{y - top}'
+        suggestions.append(suggested)
+    # Saved positions may carry offsets, such as 1920,200; they stay as they are while
+    # the sides, resolutions and scales match the saved settings.
+    if sides == suggestions and all(known.get('position', 'auto') != 'auto' and known.get('mode') == output['mode'] and
+                                    known.get('scale') == output['scale'] for output, known in zip(selected, saved)):
+        report('Positions: kept from the saved settings.')
+    else:
+        sizes = []
+        for output in selected:
+            width, height = mode_size(output['mode'], modes[output['name']]) or (0, 0)
+            sizes.append((round(width / output['scale']), round(height / output['scale'])))
+        positions = [(0, 0)]
+        for side, (pw, ph), (cw, ch) in zip(sides, sizes, sizes[1:]):
+            x, y = positions[-1]
+            positions.append({'left': (x - cw, y), 'right': (x + pw, y), 'above': (x, y - ch), 'below': (x, y + ph)}[side])
+        left, top = min(x for x, _ in positions), min(y for _, y in positions)
+        for output, (x, y) in zip(selected, positions):
+            output['position'] = f'{x - left},{y - top}'
     report('Tags (workspaces); switching to a tag moves to the display that holds it:')
     order = sorted(selected, key=lambda o: tuple(map(int, o['position'].split(','))))
     keep = all(known.get('tags') for known in saved)
@@ -208,28 +215,41 @@ def prompt(inventory, defaults=None, read=input, report=print, desktop='dwl', ke
     # DWL uses wide color only where a display supports it and otherwise keeps sRGB.
     # Hyprland's template forces it, so new displays start with sRGB there.
     color = 'wide' if renderer == 'vulkan' and desktop == 'dwl' else 'srgb'
-    several = len(detected) > 1
     report('Press Enter to accept the suggestion in brackets.')
-    if several:
+    if len(detected) > 1:
         report('Connected displays:')
         for output in detected:
             report(f'  {output["name"]} (native {output["modes"][0] if output["modes"] else "mode unknown"})')
-    selected, saved = [], []
+    outputs, selected, saved, modes = [], [], [], {}
     for output in detected:
-        name, modes = output['name'], output.get('modes', [])
+        name = output['name']
+        modes[name] = output.get('modes', [])
         known = next((o for o in defaults.get('outputs', []) if o['name'] == name and
                       o.get('edid') and o['edid'] == output.get('edid')), {})
-        mode = choose_mode(name, modes, known.get('mode', 'preferred'), read, report)
-        scale = known.get('scale') or suggested_scale(mode_size(mode, modes), output.get('size_mm', []))
+        # A display the saved settings keep off stays off unless the answer turns it on.
+        if known.get('enabled') is False and \
+                read(f'{name} is turned off in the saved settings. Keep it off? [Y/n]: ').lower() not in ('n', 'no'):
+            # Its saved settings stay for the day it is turned on again.
+            outputs.append({**known, 'name': name, 'enabled': False, 'edid': output.get('edid', '')})
+            continue
+        mode = choose_mode(name, modes[name], known.get('mode', 'preferred'), read, report)
+        scale = known.get('scale') or suggested_scale(mode_size(mode, modes[name]), output.get('size_mm', []))
         scale = float(read(f'{name} scale: how large everything appears, 1 = normal, 2 = double [{scale:g}]: ') or scale)
         selected.append({'name': name, 'mode': mode, 'scale': scale, 'position': known.get('position', 'auto'),
                          'enabled': True, 'tags': known.get('tags', []), 'color': known.get('color', color),
                          'edid': output.get('edid', '')})
+        outputs.append(selected[-1])
         saved.append(known)
-    # Placement and tag routing only matter with more than one display.
+    # Placement and tag routing only matter with more than one display in use.
+    several = len(selected) > 1
     if several:
-        arrange(selected, detected, saved, read, report)
-    settings = {**defaults, 'schema': 1, 'outputs': selected, 'machine': inventory.get('machine', {}), 'renderer': renderer}
+        arrange(selected, modes, saved, read, report)
+    # Tags belong to the displays in use; a turned-off display keeps only the unused ones.
+    used = {tag for output in selected for tag in output['tags']}
+    for output in outputs:
+        if output['enabled'] is False:
+            output['tags'] = [tag for tag in output.get('tags', []) if tag not in used]
+    settings = {**defaults, 'schema': 1, 'outputs': outputs, 'machine': inventory.get('machine', {}), 'renderer': renderer}
     settings.setdefault('vaapi', 'i965' if families == ['intel-legacy'] else 'auto')
     layouts = settings.get('keyboardLayout', 'us')
     settings['keyboardLayout'] = read(f'Keyboard layouts: one or more, comma-separated, e.g. us or us,de,tr; the first is the default [{layouts}]: ') or layouts
@@ -250,6 +270,9 @@ def prompt(inventory, defaults=None, read=input, report=print, desktop='dwl', ke
     native = {o['name']: o['modes'][0] if o.get('modes') else 'native mode' for o in detected}
     report('Summary:')
     for output in result['outputs']:
+        if not output['enabled']:
+            report(f'  {output["name"]}: off')
+            continue
         details = [f'{native.get(output["name"], "native mode")} (native)' if output['mode'] == 'preferred' else output['mode'],
                    f'scale {output["scale"]:g}']
         if several:
@@ -290,7 +313,7 @@ def main():
             # Yes/no decisions are yellow, section headings blue and suggestions cyan.
             def read(message):
                 suggestion = re.fullmatch(r'(.*)(\[[^\[\]]*\]): ', message, re.S)
-                if message.endswith('[y/N]: '):
+                if message.endswith(('[y/N]: ', '[Y/n]: ')):
                     message = paint('yellow', message, tty_out)
                 elif suggestion:
                     message = suggestion[1] + paint('cyan', suggestion[2], tty_out) + ': '

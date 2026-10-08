@@ -57,6 +57,132 @@ def edid_size(edid):
     return [width, height] if width and height else []
 
 
+def firmware_list(path):
+    return [line.strip() for line in text(path).splitlines() if line.strip() and not line.startswith('#')]
+
+
+def saved_firmware_lists(root):
+    # Portage applies a list named after a version only to that version; the plain name
+    # applies to all of them. Lists kept aside by the installer end in .pre-install-system.
+    return {path.name: firmware_list(path) for path in sorted((root / 'etc/portage/savedconfig/sys-kernel').glob('linux-firmware*'))
+            if path.is_file() and not path.name.endswith('.pre-install-system')}
+
+
+def firmware_files(base):
+    # Files and links as linux-firmware lists them: relative, without compression suffix.
+    return {re.sub(r'\.(xz|zst)$', '', str(path.relative_to(base))): path
+            for path in sorted(base.rglob('*')) if path.is_file() or path.is_symlink()}
+
+
+def firmware_size(entries, files):
+    return sum(files[entry].stat().st_size for entry in entries
+               if entry in files and files[entry].is_file() and not files[entry].is_symlink())
+
+
+# Drivers that log every firmware file they load: with a complete kernel log, no such
+# line means the device needs none (i915 on Sandy Bridge, for example).
+LOGGING_DRIVERS = ('i915', 'iwlwifi')
+
+
+def kernel_log():
+    try:
+        return subprocess.run(['dmesg'], capture_output=True, text=True, check=False).stdout
+    except FileNotFoundError:
+        return ''
+
+
+def suggested_firmware(files, sysfs=Path('/sys'), modules_dir=Path('/lib/modules', os.uname().release),
+                       modinfo='modinfo', log=None):
+    # Drivers declare the firmware they may request, but only their newest API versions:
+    # iwlwifi asks for 6000-6 and falls back to 6000-4. The kernel log names what was
+    # loaded; without that, the whole family before the version number is kept.
+    declared = {}
+    for driver in sysfs.glob('bus/*/devices/*/driver'):
+        driver = driver.resolve()
+        declared[(driver / 'module').resolve().name if (driver / 'module').exists() else driver.name] = set()
+    try:
+        records = (modules_dir / 'modules.builtin.modinfo').read_bytes().split(b'\0')
+    except OSError:
+        records = []
+    for record in records:
+        module, _, field = record.decode(errors='replace').partition('.')
+        if module in declared and field.startswith('firmware='):
+            declared[module].add(field[len('firmware='):])
+    for module in sorted(declared):
+        try:
+            result = subprocess.run([modinfo, '-F', 'firmware', module], capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            break
+        declared[module].update(line for line in result.stdout.splitlines() if line)
+    log = kernel_log() if log is None else log
+    # The log drops its oldest lines first. While the PCI bus scan that precedes every
+    # driver is still there, so are the drivers' firmware lines.
+    complete = 'Linux version' in log or 'root bus resource' in log
+    loaded = {word.strip(',:;()"\'[]') for line in log.splitlines() if 'fail' not in line.lower()
+              for word in line.split()} - {''}
+    regular = {path.resolve(): name for name, path in files.items() if path.is_file() and not path.is_symlink()}
+    chosen = set()
+    for module, names in declared.items():
+        prefixes = {family for name in names
+                    if (family := re.sub(r'[0-9][0-9.]*\.[A-Za-z0-9]+$', '', name)) and family != name}
+        family = [entry for entry in files if entry in names or any(entry.startswith(prefix) for prefix in prefixes)]
+        seen = [entry for entry in family if complete and
+                any(entry == word or entry.endswith(('/' + word, '-' + word)) for word in loaded)]
+        if seen:
+            # Keep what was loaded with its other API versions, such as a matching .pnvm.
+            stems = {re.sub(r'(-[0-9][0-9.]*)?\.[A-Za-z0-9]+$', '', entry) for entry in seen}
+            family = [entry for entry in family if any(entry.startswith((stem + '-', stem + '.')) for stem in stems)]
+        elif complete and module in LOGGING_DRIVERS:
+            family = []
+        for entry in family:
+            chosen.add(entry)
+            if files[entry].is_symlink() and files[entry].resolve() in regular:
+                chosen.add(regular[files[entry].resolve()])
+    return sorted(chosen)
+
+
+def choose_firmware(plan, root, read, interactive, base=Path('/lib/firmware'), **detection):
+    # The chosen list gets the plain name, so it applies to every linux-firmware version.
+    lists = saved_firmware_lists(root) if root is not None else {}
+    files = firmware_files(base) if base.is_dir() else {}
+    def megabytes(entries):
+        size = firmware_size(entries, files) / 1048576
+        return f'{size:.1f} MB' if size < 10 else f'{size:.0f} MB'
+    suggested = suggested_firmware(files, **detection) if files else []
+    chosen = None
+    # A plain-named list is the user's own file; the installer writes only lists it chose.
+    plan['firmware_owner'] = 'user' if 'linux-firmware' in lists else 'installer'
+    if 'linux-firmware' in lists:
+        chosen = lists['linux-firmware']
+    elif lists and len({tuple(entries) for entries in lists.values()}) == 1:
+        chosen = next(iter(lists.values()))
+    elif lists and interactive:
+        options = [(f'{name}: {len(entries)} files, {megabytes(entries)}', entries) for name, entries in lists.items()]
+        if suggested:
+            options.append((f'suggested for this computer: {len(suggested)} files, {megabytes(suggested)}', suggested))
+        options.append((f'all firmware: {megabytes(list(files))}', None))
+        default = min(range(len(lists)), key=lambda index: len(options[index][1])) + 1
+        print(paint('blue', 'Saved firmware lists differ; the chosen one applies to every linux-firmware version:', sys.stderr), file=sys.stderr)
+        for number, (label, _) in enumerate(options, 1):
+            print(f'{number}) {label}', file=sys.stderr)
+        answer = read(f'Firmware list number [{default}]: ').strip() or str(default)
+        if not answer.isdigit() or not 1 <= int(answer) <= len(options):
+            raise ValueError('invalid firmware list number')
+        chosen = options[int(answer) - 1][1]
+    elif not lists and suggested and interactive:
+        answer = read(f'Install only the firmware this computer\'s drivers use: {len(suggested)} files, {megabytes(suggested)} '
+                      f'instead of {megabytes(list(files))}? [Y/n]: ').strip().lower()
+        chosen = None if answer in ('n', 'no') else suggested
+    plan['firmware_list'] = chosen
+    # Without a choice, saved version-specific lists keep working as before.
+    keep_saved = chosen is None and lists and not interactive
+    plan['firmware_use'] = 'savedconfig' if chosen is not None or keep_saved else '-savedconfig'
+    summary = (f'{len(chosen)} listed file{"" if len(chosen) == 1 else "s"}' if chosen is not None else
+               'saved version-specific lists' if keep_saved else 'all')
+    print(paint('green', f'Firmware: {summary}', sys.stderr), file=sys.stderr)
+    return plan
+
+
 def pointers(sysfs):
     # Mice and pointing sticks report relative X/Y. Touchpads report absolute X/Y
     # with the pointer property but without the direct (touchscreen) property.
@@ -199,11 +325,19 @@ def render(plan, destination, templates):
             path = destination / stage / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
+        # The chosen firmware list has the plain name, so it applies to every version.
+        firmware = destination / stage / 'savedconfig/sys-kernel/linux-firmware'
+        if stage == 'minimal' and plan.get('firmware_list') is not None and plan.get('firmware_owner') != 'user':
+            firmware.parent.mkdir(parents=True, exist_ok=True)
+            firmware.write_text('# Firmware to install; linux-firmware leaves out every other file.\n'
+                                + ''.join(f'{entry}\n' for entry in plan['firmware_list']))
+        elif stage == 'minimal':
+            firmware.unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('probe', 'select', 'refresh-displays', 'field', 'render', 'template'))
+    parser.add_argument('action', choices=('probe', 'select', 'firmware', 'refresh-displays', 'field', 'render', 'template'))
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--graphics', default='')
     parser.add_argument('--non-interactive', action='store_true')
@@ -214,7 +348,7 @@ def main():
     parser.add_argument('--templates', type=Path)
     parser.add_argument('--no-graphics', action='store_true')
     args = parser.parse_args()
-    if args.action in ('probe', 'select'):
+    if args.action in ('probe', 'select', 'firmware'):
         def answer(message):
             if args.non_interactive:
                 raise ValueError(message + 'supply --graphics to the installer')
@@ -223,6 +357,11 @@ def main():
                 tty_out.write(paint('yellow', message, tty_out))
                 tty_out.flush()
                 return tty_in.readline()
+        if args.action == 'firmware':
+            plan = choose_firmware(json.loads(args.plan.read_text()), Path('/') if args.existing else None,
+                                   answer, not args.non_interactive)
+            print(json.dumps(plan, sort_keys=True, indent=2))
+            return
         plan = probe(root=Path('/') if args.existing else None) if args.action == 'probe' else json.loads(args.plan.read_text())
         if args.no_graphics:
             plan['graphics'] = {'families': [], 'profile': 'auto'}

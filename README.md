@@ -55,9 +55,18 @@ The menu provides:
 Existing-system mode does not replace the base system, filesystem, kernel or
 boot configuration.
 
+Every question of the chosen tier is asked at the start and recorded, so the
+installation then runs on its own. It stops only for manual work, such as configuring
+a custom kernel or restoring the GPG key of the private dotfiles, or for a repair.
+
 ## Resuming work
 
-A failed build stops the installer. Repair the problem manually, then resume:
+On Gentoo, the installer adds missing packages. An installed package is rebuilt only
+when the installer's USE flags require it; on an existing system the installer stops
+first if Portage would change that package's version. If an application fails to
+build, the installer continues without it and lists it at the end; a failed core
+package or compiler pass stops it. On Arch, any failed package stops the installer.
+After a repair, resume; only the missing work is retried:
 
 ```sh
 ./install_system.sh continue
@@ -84,17 +93,21 @@ The installer asks for account, display and input preferences and saves the
 selected settings for reuse. Chezmoi manages the dotfiles; new accounts use Zsh.
 
 Prepared root and EFI partitions can be reused without formatting. Disk changes
-require confirmation. Package-tier upgrades and switching an existing account to
-Zsh also require confirmation. New Gentoo installations use either Gentoo's
-prebuilt distribution kernel, which needs no configuration, or a custom kernel
-that you configure in `/usr/src/linux` before compilation.
+require confirmation. Choosing a tier approves all of its stages; switching an
+existing account to Zsh is confirmed at the start. New Gentoo installations use
+either Gentoo's prebuilt distribution kernel, which needs no configuration, or a
+custom kernel that you configure in `/usr/src/linux` before compilation.
+
+On Gentoo, linux-firmware can be limited to the files this computer's drivers use. The
+list is kept as `/etc/portage/savedconfig/sys-kernel/linux-firmware`, which applies to
+every linux-firmware version.
 
 Browser setup applies themes and configures automatic extension installation for
 LibreWolf and Helium. It also runs LibreWolf's setup script.
 
 In the full tier, the installer can register the machine as a new device of your
-Mullvad account for the WireGuard scripts. The account number is used once and is
-never stored or logged.
+Mullvad account for the WireGuard scripts. The account number is asked at the start,
+used once and never stored or logged; a resumed installation asks for it again.
 
 ## Related repositories
 
