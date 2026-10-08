@@ -232,16 +232,46 @@ Safety:
 EOF
 }
 
+# Colors as in part1.sh/part2.sh, only on a terminal; NO_COLOR or TERM=dumb keep plain text.
+color_enabled() { # FD
+    [[ -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb && -t "$1" ]]
+}
+
+paint() { # red|green|yellow|blue|cyan TEXT: colored when stderr is a terminal
+    local code
+    case "$1" in
+        red) code='1;91' ;;
+        green) code='1;92' ;;
+        yellow) code='1;93' ;;
+        blue) code='1;94' ;;
+        cyan) code='1;96' ;;
+    esac
+    if color_enabled 2; then printf '\e[%sm%s\e[0m' "$code" "$2"; else printf '%s' "$2"; fi
+}
+
 log() {
-    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    local stamp color=0
+    stamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    if ! color_enabled 1; then
+        printf '[%s] %s\n' "$stamp" "$*"
+        return
+    fi
+    case "$*" in
+        START\ *) color='1;94'; printf '\n' ;;
+        DONE\ *) color='1;92' ;;
+        WAITING\ *) color='1;93' ;;
+        SKIP\ *|PREREQUISITE\ *) color='0;37' ;;
+        *\?) color='1;93' ;; # approval questions
+    esac
+    printf '\e[1;96m[\e[1;95m%s\e[1;96m]\e[0m \e[%sm%s\e[0m\n' "$stamp" "$color" "$*"
 }
 
 warn() {
-    printf '[%s] WARNING: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(paint yellow "WARNING: $*")" >&2
 }
 
 die() {
-    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    printf '%s\n' "$(paint red "$PROGRAM: $*")" >&2
     exit 1
 }
 
@@ -1503,7 +1533,7 @@ select_disk_mode() {
     local choice
     [[ "$DISK_MODE" != prepared ]] || return 0
     printf 'DELETE_EVERYTHING: erase the chosen disk and create root/EFI partitions.\nSKIP: use already formatted root/EFI partitions without formatting them.\n' >/dev/tty
-    read -r -p 'Disk action [DELETE_EVERYTHING/SKIP]: ' choice </dev/tty
+    read -r -p "$(paint red 'Disk action [DELETE_EVERYTHING/SKIP]: ')" choice </dev/tty
     case "$choice" in
         DELETE_EVERYTHING) DISK_MODE=erase ;;
         SKIP)
@@ -1521,8 +1551,8 @@ confirm_disk_destruction() {
     model="$(lsblk -dnro MODEL "$DISK")"
     serial="$(lsblk -dnro SERIAL "$DISK")"
     size="$(lsblk -dnro SIZE "$DISK")"
-    if ! printf 'Target: %s\nSize: %s\nModel: %s\nSerial: %s\nErase this disk and create a FAT32 ESP plus %s root? [y/N] ' \
-        "$DISK" "$size" "${model:-unknown}" "${serial:-unknown}" "$FILESYSTEM" >/dev/tty; then
+    if ! printf 'Target: %s\nSize: %s\nModel: %s\nSerial: %s\n%s' "$DISK" "$size" "${model:-unknown}" "${serial:-unknown}" \
+        "$(paint red "Erase this disk and create a FAT32 ESP plus $FILESYSTEM root? [y/N] ")" >/dev/tty; then
         die "destructive confirmation requires a controlling terminal"
     fi
     if ! IFS= read -r confirmation </dev/tty; then
@@ -2127,7 +2157,7 @@ archive_previous_installation() {
     [[ -e "$STATE_FILE" ]] || return 0
     local answer directory archive
     ((NON_INTERACTIVE == 0)) || die "installer state exists; use continue or archive it interactively"
-    read -r -p 'Archive the previous installer record and start a new installation? [y/N] ' answer </dev/tty
+    read -r -p "$(paint yellow 'Archive the previous installer record and start a new installation? [y/N] ')" answer </dev/tty
     [[ "$answer" =~ ^[yY]([eE][sS])?$ ]] || die "previous installation retained; use continue"
     directory="$(dirname "$STATE_FILE")"
     archive="$(mktemp -d "${directory}.previous.XXXXXX")"
@@ -2237,6 +2267,7 @@ phase_display_config() {
     ensure_public_dotfiles_source
     args+=(--presets "/home/$USERNAME/.local/share/chezmoi/.chezmoidata/machinePresets.json")
     [[ "$USERNAME" != neuroleptic || "$PRIVATE_DOTFILES" == no ]] || args+=(--wireguard-profiles)
+    [[ "$DESKTOP" != hyprland ]] || args+=(--desktop hyprland)
     saved="$root/chezmoi-saved.json"
     if command -v chezmoi >/dev/null && [[ -f "/home/$USERNAME/.config/chezmoi/chezmoi.toml" ]]; then
         run_as_user chezmoi dump-config --format json >"$saved"
@@ -3037,7 +3068,7 @@ phase_kernel_config() {
     fi
     if ((KERNEL_CONFIG_READY == 0)) && [[ -s "$waiting" ]] && ((NON_INTERACTIVE == 0)); then
         local answer
-        read -r -p 'Have you prepared /usr/src/linux/.config manually and is it ready to compile? [y/N] ' answer </dev/tty
+        read -r -p "$(paint yellow 'Have you prepared /usr/src/linux/.config manually and is it ready to compile? [y/N] ')" answer </dev/tty
         [[ ! "$answer" =~ ^[yY]([eE][sS])?$ ]] || KERNEL_CONFIG_READY=1
     fi
     if ((KERNEL_CONFIG_READY == 0)) || [[ ! -s "$waiting" ]]; then
@@ -3912,8 +3943,8 @@ create_github_ssh_key() {
     run_as_user ssh-keygen -q -t ed25519 -N '' -C "$label" -f "$key" </dev/null || die "could not create $key"
     private_ssh_key_is_safe "$key" || die "unsafe new SSH key: $key"
     printf -v ssh_command 'ssh -i %q -o IdentitiesOnly=yes -o BatchMode=yes -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes' "$key"
-    printf '\nAdd the new SSH key of this machine at https://github.com/settings/ssh/new (title: %s):\n\n%s\n\n' \
-        "$label" "$(cat -- "$key.pub")" >/dev/tty
+    printf '\n%s\n\n%s\n\n' "$(paint yellow "Add the new SSH key of this machine at https://github.com/settings/ssh/new (title: $label):")" \
+        "$(paint cyan "$(cat -- "$key.pub")")" >/dev/tty
     while :; do
         read -r -p 'Press Enter once GitHub lists the key, or type later to pause: ' answer </dev/tty
         if [[ "$answer" == later ]]; then
@@ -4067,7 +4098,7 @@ validate_private_dotfiles() {
 }
 
 phase_wireguard() {
-    local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard"
+    local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard" identity
     local skipped=/var/lib/install-system/wireguard.skipped
     [[ -x "$repo/bin/wireguard.sh" && -s "$repo/libexec/wireguard-dns.sh" ]] ||
         die "the WireGuard scripts are missing; repeat the full-public-dotfiles stage"
@@ -4075,10 +4106,12 @@ phase_wireguard() {
     # The boot service runs as root and reads the device from /etc/wireguard.
     if [[ ! -e /etc/wireguard/device.json ]]; then
         if [[ -e "$home/.config/wireguard/device.json" ]]; then
-            # Private dotfiles provide this machine's Mullvad device.
+            # The saved settings of this computer select its identity in the private dotfiles.
             ln -sfn -- "$home/.config/wireguard/device.json" /etc/wireguard/device.json
             [[ ! -e "$home/.config/wireguard/default-relay" ]] ||
                 ln -sfn -- "$home/.config/wireguard/default-relay" /etc/wireguard/default-relay
+        elif identity="$(private_wireguard_identity)"; then
+            install_private_wireguard_identity "$identity"
         elif ! register_mullvad_device; then
             printf 'no Mullvad device registered\n' | write_file "$skipped" 0644
             return 0
@@ -4098,12 +4131,49 @@ phase_wireguard() {
     fi
 }
 
+private_wireguard_identity() {
+    # Prints the identity from the private dotfiles that the user confirms for this
+    # computer. Each identity is one Mullvad device and works on one computer only.
+    local source="/home/$USERNAME/.local/share/chezmoi-private/dot_config/wireguard" file name answer
+    ((NON_INTERACTIVE == 0)) && [[ "${STATE[private_dotfiles]:-}" == yes ]] || return 1
+    for file in "$source"/encrypted_private_device-*.json.asc; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        name="${file##*/encrypted_private_device-}"
+        name="${name%.json.asc}"
+        [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+        printf '\n%s\n' "$(paint yellow "Your private dotfiles contain the WireGuard identity \"$name\"; an identity works on one computer only.")" >/dev/tty
+        read -r -p "$(paint yellow "Was \"$name\" made for this computer? [y/N] ")" answer </dev/tty
+        if [[ "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_private_wireguard_identity() { # NAME
+    # Decrypted into root's WireGuard directory; the private key stays off command lines.
+    local source="/home/$USERNAME/.local/share/chezmoi-private/dot_config/wireguard" device relay
+    device="$(run_as_user chezmoi --no-tty decrypt -- "$source/encrypted_private_device-$1.json.asc")" ||
+        die "could not decrypt the WireGuard identity $1"
+    jq -e '.logged_in.device.wg_data.private_key | strings' <<<"$device" >/dev/null ||
+        die "the WireGuard identity $1 has no private key"
+    printf '%s\n' "$device" | write_file /etc/wireguard/device.json 0600
+    device=""
+    if [[ -f "$source/encrypted_private_default-relay-$1.asc" ]]; then
+        relay="$(run_as_user chezmoi --no-tty decrypt -- "$source/encrypted_private_default-relay-$1.asc")" ||
+            die "could not decrypt the default relay of $1"
+        printf '%s\n' "$relay" | write_file /etc/wireguard/default-relay 0600
+    fi
+    log "Installed the WireGuard identity \"$1\" from the private dotfiles."
+}
+
 register_mullvad_device() {
     # Registers this machine as a new device of the user's Mullvad account. The account
     # number, access token and private key never reach logs, state or command lines.
     local account token response private name ipv4 ipv6 relay
     ((NON_INTERACTIVE == 0)) || return 1
-    printf '\nWireGuard: register this machine as a new device of your Mullvad account (an\naccount allows five devices). Leave the account number empty to skip the VPN.\n' >/dev/tty
+    printf '\n%s\n' "$(paint yellow $'WireGuard: register this machine as a new device of your Mullvad account (an\naccount allows five devices). Leave the account number empty to skip the VPN.')" >/dev/tty
     IFS= read -r -s -p 'Mullvad account number: ' account </dev/tty
     printf '\n' >/dev/tty
     account="${account//[[:space:]]/}"
@@ -4325,7 +4395,7 @@ approve_tier_transition() {
         return 0
     fi
     while true; do
-        printf 'Continue? [y/N] ' >/dev/tty
+        paint yellow 'Continue? [y/N] ' >/dev/tty
         IFS= read -r answer </dev/tty
         case "$answer" in
             y|Y|yes|YES|Yes)
@@ -4562,7 +4632,7 @@ run_continue() {
             [[ -n "$requested_tier" ]] || \
                 die "state-less existing-system adoption requires --tier in non-interactive mode"
         else
-            printf 'No installer state was found. Adopt this %s system and inspect its stages? [y/N] ' "$DISTRIBUTION" >/dev/tty
+            paint yellow "No installer state was found. Adopt this $DISTRIBUTION system and inspect its stages? [y/N] " >/dev/tty
             IFS= read -r answer </dev/tty
             if [[ ! "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
                 resume_new_from_host "$requested_tier"

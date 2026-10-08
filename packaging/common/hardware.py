@@ -14,13 +14,21 @@ HERE = Path(__file__).resolve().parent
 FAMILIES = ('intel-legacy', 'intel-modern', 'amd', 'radeon', 'nvidia-open', 'nvidia-closed', 'virtual')
 DESCRIPTIONS = {
     'intel-legacy': 'Intel i965 VA-API (older Intel, including HD 3000); GLES2 rendering',
-    'intel-modern': 'Intel iHD VA-API (Broadwell+); renderer selected separately',
-    'amd': 'AMD amdgpu/radeonsi (GCN and newer)',
+    'intel-modern': 'Intel iHD VA-API (Broadwell+); Vulkan rendering',
+    'amd': 'AMD amdgpu/radeonsi (GCN and newer); Vulkan rendering',
     'radeon': 'Older AMD Radeon (r600/r300); GLES2 rendering',
-    'nvidia-open': 'NVIDIA open kernel modules (Turing+)',
-    'nvidia-closed': 'NVIDIA proprietary 580 branch (older supported GPUs)',
+    'nvidia-open': 'NVIDIA open kernel modules (Turing+); Vulkan rendering',
+    'nvidia-closed': 'NVIDIA proprietary 580 branch (older supported GPUs); Vulkan rendering',
     'virtual': 'Virtual/software display (virtio, VMware, QXL); Mesa GLES2',
 }
+COLORS = {'red': '1;91', 'green': '1;92', 'yellow': '1;93', 'blue': '1;94', 'cyan': '1;96'}
+
+
+def paint(color, message, stream):
+    # Colors as in the installer, only on a terminal; NO_COLOR or TERM=dumb keep plain text.
+    if os.environ.get('NO_COLOR') or os.environ.get('TERM', 'dumb') == 'dumb' or not stream.isatty():
+        return message
+    return f'\033[{COLORS[color]}m{message}\033[0m'
 
 
 def text(path):
@@ -33,6 +41,20 @@ def text(path):
 def input_bits(path):
     words = text(path).split()
     return int(words[-1], 16) if words else 0
+
+
+def edid_size(edid):
+    # Physical size in millimetres from the first detailed timing, otherwise from the
+    # basic size in centimetres. Projectors report none; many TVs report only their
+    # aspect ratio, such as 1600x900, which is no size either.
+    if len(edid) < 128 or edid[:8] != b'\x00\xff\xff\xff\xff\xff\xff\x00':
+        return []
+    width, height = edid[66] | (edid[68] >> 4) << 8, edid[67] | (edid[68] & 0x0f) << 8
+    if not (edid[54] or edid[55]) or not (width and height):
+        width, height = edid[21] * 10, edid[22] * 10
+    if (width, height) in {(16, 9), (16, 10), (160, 90), (160, 100), (1600, 900), (1600, 1000)}:
+        return []
+    return [width, height] if width and height else []
 
 
 def pointers(sysfs):
@@ -79,7 +101,7 @@ def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
         except OSError:
             edid = b''
         outputs.append({'name': path.name.split('-', 1)[1], 'modes': text(path / 'modes').splitlines(),
-                        'edid': hashlib.sha256(edid).hexdigest() if edid else ''})
+                        'edid': hashlib.sha256(edid).hexdigest() if edid else '', 'size_mm': edid_size(edid)})
     saved = root is not None and any(p.is_file() for p in (root / 'etc/portage/savedconfig').glob('**/sys-kernel/linux-firmware*')
                                     if not p.name.endswith('.pre-install-system'))
     sof = any((p / 'driver').resolve().name.startswith('sof-audio')
@@ -95,7 +117,7 @@ def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
 def choose(plan, requested, read=input):
     families = list(dict.fromkeys(requested))
     for device in plan['gpus']:
-        print(f'Detected: {device.get("model") or device["slot"]}; PCI {device["vendor"]}:{device.get("device", "?")}; kernel driver {device["driver"] or "unbound"}', file=sys.stderr)
+        print(paint('cyan', f'Detected: {device.get("model") or device["slot"]}; PCI {device["vendor"]}:{device.get("device", "?")}; kernel driver {device["driver"] or "unbound"}', sys.stderr), file=sys.stderr)
     if not families:
         for device in plan['gpus']:
             vendor, driver = device['vendor'], device['driver']
@@ -140,7 +162,7 @@ def choose(plan, requested, read=input):
                'nvidia' if families[0].startswith('nvidia') else 'mesa')
     plan['graphics'] = {'families': families, 'profile': profile}
     for family in families:
-        print(f'Selected: {DESCRIPTIONS[family]} [{family}]', file=sys.stderr)
+        print(paint('green', f'Selected: {DESCRIPTIONS[family]} [{family}]', sys.stderr), file=sys.stderr)
     return plan
 
 
@@ -198,7 +220,7 @@ def main():
                 raise ValueError(message + 'supply --graphics to the installer')
             # A terminal cannot seek, so it gets separate read and write streams ('r+' fails).
             with open('/dev/tty') as tty_in, open('/dev/tty', 'w') as tty_out:
-                tty_out.write(message)
+                tty_out.write(paint('yellow', message, tty_out))
                 tty_out.flush()
                 return tty_in.readline()
         plan = probe(root=Path('/') if args.existing else None) if args.action == 'probe' else json.loads(args.plan.read_text())
@@ -231,5 +253,5 @@ if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f'hardware: {error}', file=sys.stderr)
+        print(paint('red', f'hardware: {error}', sys.stderr), file=sys.stderr)
         sys.exit(1)

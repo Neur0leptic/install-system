@@ -8,6 +8,12 @@ from pathlib import Path
 import re
 import sys
 
+from hardware import paint, probe
+
+# GPU families whose drivers are installed with Vulkan; the others render with GLES2.
+VULKAN_FAMILIES = ('intel-modern', 'amd', 'nvidia-open', 'nvidia-closed')
+SIDES = ('left', 'right', 'above', 'below')
+
 
 def device_name(name):
     # DWL and Hyprland match input devices by name, lower-cased with hyphens for spaces.
@@ -82,10 +88,13 @@ def normalize(value):
 def choose_mode(name, modes, suggested, read, report):
     # The kernel lists a display's modes native first and without refresh rates.
     modes = list(dict.fromkeys(modes))
-    report(f'{name} resolutions ("preferred" is the native mode):')
+    report(f'{name} resolutions:')
     for number, mode in enumerate(modes, 1):
-        report(f'  {number}) {mode}')
-    answer = read(f'{name} resolution: number, or WIDTHxHEIGHT@HZ such as 2560x1440@144 [{suggested}]: ')
+        report(f'  {number}) {mode}' + (' (native)' if number == 1 else ''))
+    report('To set a refresh rate, type WIDTHxHEIGHT@HZ, for example 2560x1440@144.')
+    # "preferred" follows the display's native mode, so the suggestion names that mode.
+    shown = f'native {modes[0] if modes else "mode"}' if suggested == 'preferred' else suggested
+    answer = read(f'{name} resolution: number or WIDTHxHEIGHT@HZ [{shown}]: ')
     if not answer:
         return suggested
     if answer.isdigit():
@@ -95,14 +104,86 @@ def choose_mode(name, modes, suggested, read, report):
     return answer
 
 
+def mode_size(mode, modes):
+    # "preferred" stands for the native mode, which the kernel lists first.
+    match = re.match(r'([0-9]+)x([0-9]+)', modes[0] if mode == 'preferred' and modes else mode)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def suggested_scale(size, size_mm):
+    # Pixel density decides how large text appears. Laptop panels are viewed from closer,
+    # so they get a denser target. Displays without a physical size and TV-sized ones,
+    # watched from afar, follow the resolution instead.
+    if not size:
+        return 1.0
+    if len(size_mm) == 2 and min(size_mm) > 0:
+        diagonal = math.hypot(*size_mm) / 25.4
+        if 10 <= diagonal <= 50:
+            density = math.hypot(*size) / diagonal
+            return min(3.0, max(1.0, round(density / (135 if diagonal < 20 else 110) * 4) / 4))
+    return 1.0 if size[1] <= 1200 else 1.5 if size[1] <= 1600 else 2.0
+
+
+def side_of(current, previous):
+    # Saved positions suggest their side again, such as "right" for 1920,0 beside 0,0.
+    if 'auto' in (current['position'], previous['position']):
+        return 'right'
+    (cx, cy), (px, py) = (map(int, o['position'].split(',')) for o in (current, previous))
+    if abs(cx - px) >= abs(cy - py):
+        return 'right' if cx >= px else 'left'
+    return 'below' if cy > py else 'above'
+
+
+def split_tags(count):
+    # Ten tags in groups that are as even as possible: two displays get 1-5 and 6-10.
+    size, extra = divmod(10, count)
+    groups, start = [], 1
+    for index in range(count):
+        end = start + size + (index < extra)
+        groups.append(list(range(start, end)))
+        start = end
+    return groups
+
+
+def arrange(selected, detected, saved, read, report):
+    # Each display is placed beside the previous one; the pixel positions follow from the
+    # answers, using the size the display has after scaling.
+    report('Arrangement (where the displays stand on your desk):')
+    sides = []
+    for previous, current in zip(selected, selected[1:]):
+        suggested = side_of(current, previous)
+        answer = read(f'Where is {current["name"]} relative to {previous["name"]}? left, right, above or below [{suggested}]: ') or suggested
+        if answer not in SIDES:
+            raise ValueError(f'answer left, right, above or below for {current["name"]}')
+        sides.append(answer)
+    sizes = []
+    for output, known in zip(selected, detected):
+        width, height = mode_size(output['mode'], known.get('modes', [])) or (0, 0)
+        sizes.append((round(width / output['scale']), round(height / output['scale'])))
+    positions = [(0, 0)]
+    for side, (pw, ph), (cw, ch) in zip(sides, sizes, sizes[1:]):
+        x, y = positions[-1]
+        positions.append({'left': (x - cw, y), 'right': (x + pw, y), 'above': (x, y - ch), 'below': (x, y + ph)}[side])
+    left, top = min(x for x, _ in positions), min(y for _, y in positions)
+    for output, (x, y) in zip(selected, positions):
+        output['position'] = f'{x - left},{y - top}'
+    report('Tags (workspaces); switching to a tag moves to the display that holds it:')
+    order = sorted(selected, key=lambda o: tuple(map(int, o['position'].split(','))))
+    keep = all(known.get('tags') for known in saved)
+    for output, group in zip(order, split_tags(len(order))):
+        tags = output['tags'] if keep else group
+        answer = read(f'Tags on {output["name"]}: comma-separated, - = none [{",".join(map(str, tags)) or "none"}]: ')
+        output['tags'] = ([] if answer == '-' else [int(t) for t in answer.split(',') if t]) if answer else tags
+
+
 def choose_mouse(inventory, current, read, report):
     detected = [device_name(name) for name in inventory.get('pointers', [])]
-    report('Pointing devices (one can get its own sensitivity; the others keep the default):')
+    if not detected:
+        return current
+    report('Pointing devices (all use the default speed):')
     for number, name in enumerate(detected, 1):
         report(f'  {number}) {name}')
-    if not detected:
-        report('  none detected')
-    answer = read(f'Mouse with its own sensitivity: number, name, or - for none [{current or "none"}]: ')
+    answer = read(f'Give one of them its own speed: number or name, - = none [{current or "none"}]: ')
     if not answer:
         return current
     if answer == '-':
@@ -115,82 +196,76 @@ def choose_mouse(inventory, current, read, report):
     return device_name(answer)
 
 
-def prompt(inventory, defaults=None, read=input, report=print, ask_wireguard=False):
+def prompt(inventory, defaults=None, read=input, report=print, desktop='dwl', keep_wireguard=False):
+    # Only preferences are asked. The renderer and color mode follow the GPU; video
+    # decoding, backlight and render device stay automatic unless saved settings or a
+    # preset name them.
     defaults = defaults or {}
     detected = inventory.get('outputs', [])
-    report('Press Enter to accept the suggestion in brackets.')
-    report('Connected displays:')
-    for output in detected:
-        report(f'  {output["name"]} (native {output["modes"][0] if output["modes"] else "mode unknown"})')
-    count = int(read(f'How many displays should be configured? (0 = automatic) [{len(detected)}]: ') or len(detected))
-    # Displays that are not connected keep the compositor's automatic setup.
-    if not 0 <= count <= len(detected):
-        raise ValueError(f'configure between 0 and {len(detected)} connected displays')
-    selected = []
-    for index in range(count):
-        suggested = detected[index]['name']
-        name = read(f'Display {index + 1} connector [{suggested}]: ') or suggested
-        matches = [item for item in detected if item['name'] == name]
-        if len(matches) != 1:
-            raise ValueError(f'not a connected display: {name}')
-        known = matches[0]
-        suggested_mode, suggested_scale, suggested_position = 'preferred', '1', 'auto'
-        saved = next((o for o in defaults.get('outputs', []) if o['name'] == name and
-                      o.get('edid') and o['edid'] == known.get('edid')), {})
-        suggested_mode = saved.get('mode', suggested_mode)
-        suggested_scale = str(saved.get('scale', suggested_scale))
-        suggested_position = saved.get('position', suggested_position)
-        mode = choose_mode(name, known.get('modes', []), suggested_mode, read, report)
-        scale = float(read(f'{name} scale [{suggested_scale}]: ') or suggested_scale)
-        position = read(f'{name} position in logical pixels [auto or X,Y; {suggested_position}]: ') or suggested_position
-        tag_default = ','.join(map(str, saved.get('tags', [])))
-        tags = read(f'{name} workspace/tag numbers, comma-separated (- = unbound) [{tag_default}]: ') or tag_default
-        if tags == '-':
-            tags = ''
-        color = read(f'{name} color mode: srgb or wide (requires a capable display) [{saved.get("color", "srgb")}]: ') or saved.get('color', 'srgb')
-        selected.append({'name': name, 'mode': mode, 'scale': scale, 'position': position, 'enabled': True,
-                         'tags': [int(t) for t in tags.split(',') if t], 'color': color, 'edid': known.get('edid', '')})
-    chosen = {item['name'] for item in selected}
-    for output in detected if count else []:
-        if output['name'] not in chosen:
-            selected.append({'name': output['name'], 'enabled': False, 'edid': output.get('edid', '')})
-    settings = {**defaults, 'schema': 1, 'outputs': selected, 'machine': inventory.get('machine', {})}
     families = inventory.get('graphics', {}).get('families', [])
-    safe = any(f in ('intel-legacy', 'radeon', 'virtual') for f in families)
-    renderer = settings.get('renderer', 'gles2' if safe else 'auto')
-    report('DWL/MPV renderer: auto lets the application choose; GLES2 supports older GPUs; Vulkan requires driver support. Hyprland uses its own renderer.')
-    settings['renderer'] = read(f'DWL/MPV renderer [auto/gles2/vulkan; {renderer}]: ') or renderer
-    device = settings.get('renderDevice', '')
-    if len(inventory.get('gpus', [])) > 1:
-        for gpu in inventory['gpus']:
-            report(f'  {gpu.get("model") or gpu["slot"]}: {", ".join(gpu.get("render_nodes", [])) or "render node unavailable"}')
-        answer = read(f'Preferred DWL /dev/dri/by-path/...-render node (- = automatic) [{device}]: ') or device
-        settings['renderDevice'] = '' if answer == '-' else answer
-    vaapi = settings.get('vaapi', 'i965' if families == ['intel-legacy'] else 'auto')
-    settings['vaapi'] = read(f'VA-API driver [auto/i965/iHD/radeonsi/nvidia; {vaapi}]: ') or vaapi
-    for key, label, default in [('keyboardLayout', 'Keyboard layouts, comma-separated', 'us'),
-                                ('keyboardOptions', 'XKB options', 'grp:alt_shift_toggle')]:
-        default = settings.get(key, default)
-        answer = read(f'{label} (- clears optional fields) [{default}]: ') or default
-        settings[key] = '' if answer == '-' else answer
+    renderer = defaults.get('renderer') or ('vulkan' if families[:1] and families[0] in VULKAN_FAMILIES
+                                            else 'gles2' if families else 'auto')
+    # DWL uses wide color only where a display supports it and otherwise keeps sRGB.
+    # Hyprland's template forces it, so new displays start with sRGB there.
+    color = 'wide' if renderer == 'vulkan' and desktop == 'dwl' else 'srgb'
+    several = len(detected) > 1
+    report('Press Enter to accept the suggestion in brackets.')
+    if several:
+        report('Connected displays:')
+        for output in detected:
+            report(f'  {output["name"]} (native {output["modes"][0] if output["modes"] else "mode unknown"})')
+    selected, saved = [], []
+    for output in detected:
+        name, modes = output['name'], output.get('modes', [])
+        known = next((o for o in defaults.get('outputs', []) if o['name'] == name and
+                      o.get('edid') and o['edid'] == output.get('edid')), {})
+        mode = choose_mode(name, modes, known.get('mode', 'preferred'), read, report)
+        scale = known.get('scale') or suggested_scale(mode_size(mode, modes), output.get('size_mm', []))
+        scale = float(read(f'{name} scale: how large everything appears, 1 = normal, 2 = double [{scale:g}]: ') or scale)
+        selected.append({'name': name, 'mode': mode, 'scale': scale, 'position': known.get('position', 'auto'),
+                         'enabled': True, 'tags': known.get('tags', []), 'color': known.get('color', color),
+                         'edid': output.get('edid', '')})
+        saved.append(known)
+    # Placement and tag routing only matter with more than one display.
+    if several:
+        arrange(selected, detected, saved, read, report)
+    settings = {**defaults, 'schema': 1, 'outputs': selected, 'machine': inventory.get('machine', {}), 'renderer': renderer}
+    settings.setdefault('vaapi', 'i965' if families == ['intel-legacy'] else 'auto')
+    layouts = settings.get('keyboardLayout', 'us')
+    settings['keyboardLayout'] = read(f'Keyboard layouts: one or more, comma-separated, e.g. us or us,de,tr; the first is the default [{layouts}]: ') or layouts
+    options = settings.get('keyboardOptions', 'grp:alt_shift_toggle')
+    if ',' in settings['keyboardLayout']:
+        answer = read(f'Keyboard options: grp:alt_shift_toggle switches layouts with Alt+Shift, - = none [{options or "none"}]: ') or options
+        options = '' if answer == '-' else answer
+    settings['keyboardOptions'] = options
     settings['mouse'] = choose_mouse(inventory, settings.get('mouse', ''), read, report)
     if settings['mouse']:
         default = settings.get('sensitivity', 0)
-        settings['sensitivity'] = float(read(f'Mouse sensitivity -1 to 1 [{default}]: ') or default)
-    default = settings.get('backlight', '')
-    answer = read(f'Backlight device (empty = automatic) (- clears optional fields) [{default}]: ') or default
-    settings['backlight'] = '' if answer == '-' else answer
-    # VPN identity is deliberately not inferred from the physical-machine preset. Named
-    # profiles come from the private dotfiles; other accounts register a device later.
-    if ask_wireguard:
-        default = settings.get('wireguardProfile', '')
-        answer = read(f'WireGuard profile from the private dotfiles (- = none) [{default}]: ') or default
-        settings['wireguardProfile'] = '' if answer == '-' else answer
-    else:
+        settings['sensitivity'] = float(read(f'{settings["mouse"]} speed: -1 = slowest, 0 = default, 1 = fastest [{default:g}]: ') or default)
+    # The WireGuard stage asks for the VPN identity. Only a profile already saved for this
+    # computer is kept; presets never name one.
+    if not keep_wireguard:
         settings['wireguardProfile'] = ''
     result = normalize(settings)
-    report(json.dumps(result, indent=2))
-    if read('Use these display settings? [y/N]: ').lower() not in ('y', 'yes'):
+    native = {o['name']: o['modes'][0] if o.get('modes') else 'native mode' for o in detected}
+    report('Summary:')
+    for output in result['outputs']:
+        details = [f'{native.get(output["name"], "native mode")} (native)' if output['mode'] == 'preferred' else output['mode'],
+                   f'scale {output["scale"]:g}']
+        if several:
+            details += [f'position {output["position"]}', 'tags ' + (','.join(map(str, output['tags'])) or 'none')]
+        details.append(('wide color where supported' if desktop == 'dwl' else 'wide color') if output['color'] == 'wide' else 'sRGB')
+        report(f'  {output["name"]}: {", ".join(details)}')
+    if not result['outputs']:
+        report('  Displays: automatic')
+    report(f'  Graphics: renderer {result["renderer"]}, video decoding {result["vaapi"]}'
+           + (f', {result["renderDevice"]}' if result['renderDevice'] else '')
+           + (f', brightness {result["backlight"]}' if result['backlight'] else ''))
+    report(f'  Keyboard: {result["keyboardLayout"]}' + (f' ({result["keyboardOptions"]})' if result['keyboardOptions'] else ''))
+    report('  Pointer speed: ' + (f'{result["mouse"]} {result["sensitivity"]:g}' if result['mouse'] else 'default'))
+    if result['wireguardProfile']:
+        report(f'  WireGuard: {result["wireguardProfile"]}')
+    if read('Save these settings? [y/N]: ').lower() not in ('y', 'yes'):
         raise ValueError('display settings were not confirmed')
     return result
 
@@ -203,14 +278,22 @@ def main():
     parser.add_argument('--check-hardware', action='store_true')
     parser.add_argument('--input', type=Path)
     parser.add_argument('--check-target', type=Path)
+    # Keeps a WireGuard profile that the saved settings of this computer already name.
     parser.add_argument('--wireguard-profiles', action='store_true')
+    parser.add_argument('--desktop', choices=('dwl', 'hyprland'), default='dwl')
     args = parser.parse_args()
     if args.input:
         result = normalize(json.loads(args.input.read_text()))
     else:
         # A terminal cannot seek, so it gets separate read and write streams ('r+' fails).
         with open('/dev/tty') as tty_in, open('/dev/tty', 'w') as tty_out:
+            # Yes/no decisions are yellow, section headings blue and suggestions cyan.
             def read(message):
+                suggestion = re.fullmatch(r'(.*)(\[[^\[\]]*\]): ', message, re.S)
+                if message.endswith('[y/N]: '):
+                    message = paint('yellow', message, tty_out)
+                elif suggestion:
+                    message = suggestion[1] + paint('cyan', suggestion[2], tty_out) + ': '
                 tty_out.write(message)
                 tty_out.flush()
                 answer = tty_in.readline()
@@ -218,7 +301,7 @@ def main():
                     raise ValueError('display prompt reached EOF')
                 return answer.strip()
             def report(message):
-                tty_out.write(message + '\n')
+                tty_out.write((paint('blue', message, tty_out) if message.endswith(':') else message) + '\n')
                 tty_out.flush()
             inventory = json.loads(args.inventory.read_text())
             defaults = {}
@@ -231,12 +314,11 @@ def main():
                 presets = json.loads(args.presets.read_text())['machinePresets']
                 for name, preset in presets.items():
                     if all(inventory.get('machine', {}).get(k) == v for k, v in preset['match'].items()):
-                        if read(f'Hardware matches the {name} preset. Use its preferences as suggestions? [y/N]: ').lower() in ('y', 'yes'):
+                        if read(f'Saved settings "{name}" match this computer model. Use them as suggestions? [y/N]: ').lower() in ('y', 'yes'):
                             defaults = preset['settings']
                         break
-            result = prompt(inventory, defaults, read, report, args.wireguard_profiles)
+            result = prompt(inventory, defaults, read, report, args.desktop, args.wireguard_profiles)
     if args.check_hardware:
-        from hardware import probe
         current = probe()
         if result['machine'] and result['machine'] != current['machine']:
             raise ValueError('machine changed; review desktop settings')
@@ -255,5 +337,5 @@ if __name__ == '__main__':
     try:
         main()
     except (OSError, ValueError, TypeError, KeyError) as error:
-        print(f'displays: {error}', file=sys.stderr)
+        print(paint('red', f'displays: {error}', sys.stderr), file=sys.stderr)
         sys.exit(1)
