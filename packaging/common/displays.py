@@ -79,6 +79,22 @@ def normalize(value):
     return settings
 
 
+def choose_mode(name, modes, suggested, read, report):
+    # The kernel lists a display's modes native first and without refresh rates.
+    modes = list(dict.fromkeys(modes))
+    report(f'{name} resolutions ("preferred" is the native mode):')
+    for number, mode in enumerate(modes, 1):
+        report(f'  {number}) {mode}')
+    answer = read(f'{name} resolution: number, or WIDTHxHEIGHT@HZ such as 2560x1440@144 [{suggested}]: ')
+    if not answer:
+        return suggested
+    if answer.isdigit():
+        if not 1 <= int(answer) <= len(modes):
+            raise ValueError(f'{name} has no resolution with that number')
+        return modes[int(answer) - 1]
+    return answer
+
+
 def choose_mouse(inventory, current, read, report):
     detected = [device_name(name) for name in inventory.get('pointers', [])]
     report('Pointing devices (one can get its own sensitivity; the others keep the default):')
@@ -102,25 +118,29 @@ def choose_mouse(inventory, current, read, report):
 def prompt(inventory, defaults=None, read=input, report=print):
     defaults = defaults or {}
     detected = inventory.get('outputs', [])
-    report('Connected outputs (physical modes; scale is a separate preference):')
+    report('Press Enter to accept the suggestion in brackets.')
+    report('Connected displays:')
     for output in detected:
-        report(f'  {output["name"]}: {", ".join(output["modes"]) or "mode list unavailable"}')
+        report(f'  {output["name"]} (native {output["modes"][0] if output["modes"] else "mode unknown"})')
     count = int(read(f'How many displays should be configured? (0 = automatic) [{len(detected)}]: ') or len(detected))
-    if not 0 <= count <= 16:
-        raise ValueError('display count must be between 0 and 16')
+    # Displays that are not connected keep the compositor's automatic setup.
+    if not 0 <= count <= len(detected):
+        raise ValueError(f'configure between 0 and {len(detected)} connected displays')
     selected = []
     for index in range(count):
-        suggested = detected[index]['name'] if index < len(detected) else ''
+        suggested = detected[index]['name']
         name = read(f'Display {index + 1} connector [{suggested}]: ') or suggested
         matches = [item for item in detected if item['name'] == name]
-        known = matches[0] if len(matches) == 1 else {}
+        if len(matches) != 1:
+            raise ValueError(f'not a connected display: {name}')
+        known = matches[0]
         suggested_mode, suggested_scale, suggested_position = 'preferred', '1', 'auto'
         saved = next((o for o in defaults.get('outputs', []) if o['name'] == name and
                       o.get('edid') and o['edid'] == known.get('edid')), {})
         suggested_mode = saved.get('mode', suggested_mode)
         suggested_scale = str(saved.get('scale', suggested_scale))
         suggested_position = saved.get('position', suggested_position)
-        mode = read(f'{name} physical resolution [preferred or WIDTHxHEIGHT@HZ; {suggested_mode}]: ') or suggested_mode
+        mode = choose_mode(name, known.get('modes', []), suggested_mode, read, report)
         scale = float(read(f'{name} scale [{suggested_scale}]: ') or suggested_scale)
         position = read(f'{name} position in logical pixels [auto or X,Y; {suggested_position}]: ') or suggested_position
         tag_default = ','.join(map(str, saved.get('tags', [])))
