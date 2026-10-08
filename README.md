@@ -25,7 +25,9 @@ Torrent tools are optional and selected separately.
 - Internet access and root privileges.
 - Bash, Python 3.9+, Git, curl and GPG.
 - The corresponding Gentoo or Arch UEFI live environment for new installations.
-- SSH/GPG access only if private dotfiles are accepted.
+- GitHub SSH and GPG access only if private dotfiles are accepted. Without an
+  SSH key, the installer creates one for the machine and waits until it is added
+  to GitHub.
 
 ## Usage
 

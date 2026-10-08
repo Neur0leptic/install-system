@@ -42,6 +42,7 @@ readonly PRIVATE_DOTFILES_URL="git@github.com:Neur0leptic/dotfiles-private.git"
 readonly PRIVATE_APPLY_POLICY="selected-private-with-transmission-v2"
 # Published at https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
 readonly GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+readonly SSH_CLIENT_POLICY="etc/ssh/ssh_config.d/00-install-system.conf"
 readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
 readonly -a HOST_TOOLS=(blkid chroot cmp curl findmnt flock git gpg gpgv lsblk mkfs.f2fs mkfs.vfat mount mountpoint parted partprobe python3 readlink sha256sum sha512sum tar udevadm umount wipefs xz)
 
@@ -3302,6 +3303,15 @@ phase_desktop_packages() {
 
     [[ -f /etc/pam.d/system-login ]] || die "system-login PAM configuration is missing"
     system_policy apply dwl etc/pam.d/system-login
+    ssh_client_reads_rsa || system_policy apply dwl "$SSH_CLIENT_POLICY"
+}
+
+ssh_client_reads_rsa() {
+    # Gentoo's RevokedHostKeys list holds an RSA key. A client built without OpenSSL
+    # cannot read it and then refuses every host, including GitHub for private dotfiles.
+    local types
+    types="$(ssh -Q key 2>/dev/null)" || return 1
+    grep -qx ssh-rsa <<<"$types"
 }
 
 validate_desktop_packages() {
@@ -3313,7 +3323,8 @@ validate_desktop_packages() {
     groups=" $(id -nG "$USERNAME") " || return 1
     policy_groups="$(system_policy_groups dwl)" && [[ -n "$policy_groups" ]] || return 1
     for group in $policy_groups; do [[ "$groups" == *" $group "* ]] || return 1; done
-    system_policy_services check dwl && system_policy check dwl etc/pam.d/system-login
+    system_policy_services check dwl && system_policy check dwl etc/pam.d/system-login &&
+        { ssh_client_reads_rsa || system_policy check dwl "$SSH_CLIENT_POLICY"; }
 }
 
 phase_user_shell() {
@@ -3810,6 +3821,36 @@ private_dotfiles_files() {
         "$action" --include=files,symlinks,dirs --parent-dirs --recursive=false -- "${private_targets[@]}"
 }
 
+create_github_ssh_key() {
+    local key="/home/$USERNAME/.ssh/id_ed25519_github" label ssh_command answer
+    if ((NON_INTERACTIVE)); then
+        request_wait "restore the private GitHub SSH key or load it into ssh-agent, then continue"
+        return 1
+    fi
+    if [[ -e "$key" || -L "$key" ]]; then
+        request_wait "private SSH key must be a non-symlink, user-owned private file under /home/$USERNAME: $key"
+        return 1
+    fi
+    label="$USERNAME@$HOSTNAME_VALUE"
+    [[ "$MODE" != existing ]] || label="$USERNAME@$(uname -n)"
+    # One key per machine, revocable on its own. Like the keys on the existing machines
+    # it has no passphrase: the clone runs in batch mode and syncs need no agent.
+    run_as_user ssh-keygen -q -t ed25519 -N '' -C "$label" -f "$key" </dev/null || die "could not create $key"
+    private_ssh_key_is_safe "$key" || die "unsafe new SSH key: $key"
+    printf -v ssh_command 'ssh -i %q -o IdentitiesOnly=yes -o BatchMode=yes -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes' "$key"
+    printf '\nAdd the new SSH key of this machine at https://github.com/settings/ssh/new (title: %s):\n\n%s\n\n' \
+        "$label" "$(cat -- "$key.pub")" >/dev/tty
+    while :; do
+        read -r -p 'Press Enter once GitHub lists the key, or type later to pause: ' answer </dev/tty
+        if [[ "$answer" == later ]]; then
+            request_wait "add $key.pub to GitHub, then continue"
+            return 1
+        fi
+        run_as_user env "GIT_SSH_COMMAND=$ssh_command" git ls-remote "$PRIVATE_DOTFILES_URL" HEAD >/dev/null 2>&1 && return 0
+        printf 'GitHub does not accept the key yet.\n' >/dev/tty
+    done
+}
+
 phase_private_dotfiles() {
     local home="/home/$USERNAME" source parent temporary weather weather_sha uid
     source="$home/.local/share/chezmoi-private"
@@ -3844,6 +3885,10 @@ EOF
     ensure_github_known_host
 
     if [[ -z "$SSH_KEY" ]] && private_ssh_key_is_safe "$home/.ssh/id_ed25519_github"; then
+        SSH_KEY="$home/.ssh/id_ed25519_github"
+    fi
+    if [[ -z "$SSH_KEY" ]] && ! run_as_user ssh-add -l >/dev/null 2>&1; then
+        create_github_ssh_key || return 0
         SSH_KEY="$home/.ssh/id_ed25519_github"
     fi
     if [[ -n "$SSH_KEY" ]]; then
