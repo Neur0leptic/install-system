@@ -163,6 +163,7 @@ FEATURE_MAIL="false"
 FEATURE_KEEPASS="false"
 FEATURE_WIREGUARD="false"
 TORRENT="ask"
+KERNEL_CHOICE="ask"
 DISK_MODE="erase"
 ACCOUNT_PASSWORD=""
 export -n ACCOUNT_PASSWORD
@@ -217,6 +218,7 @@ Options:
   --ssh-key FILE
   --no-efi-entry
   --torrent yes|no              Optional full-tier torrent/search tools
+  --kernel dist|custom          New Gentoo: prebuilt distribution kernel, or one you configure
   --non-interactive
   --dry-run
   --step STAGE
@@ -292,7 +294,7 @@ root_lock_file_is_safe() {
 }
 
 valid_state_key() {
-    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
+    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|kernel|disk_mode|private_dotfiles|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
 }
 
 valid_state_value() {
@@ -311,6 +313,7 @@ validate_loaded_state() {
     [[ ! -v STATE[policy_ref] || "${STATE[policy_ref]}" =~ ^[0-9a-f]{40}$ ]] || die "invalid policy revision in state"
     [[ ! -v STATE[compiler_policy] || "${STATE[compiler_policy]}" =~ ^(bootstrap|prepolly|gcc|clang|polly|final)$ ]] || die "invalid compiler transition in state"
     [[ "${STATE[torrent]:-ask}" =~ ^(ask|yes|no)$ ]] || die "invalid torrent choice"
+    [[ "${STATE[kernel]:-custom}" =~ ^(dist|custom)$ ]] || die "invalid kernel choice in state"
     [[ "${STATE[disk_mode]:-erase}" =~ ^(erase|prepared)$ ]] || die "invalid disk mode"
     [[ "${STATE[mode]}" =~ ^(new|existing)$ ]] || die "invalid mode in state"
     [[ "${STATE[mode]}" != "existing" || "${STATE[tier]}" != "minimal" ]] || die "invalid existing-mode tier in state"
@@ -464,6 +467,7 @@ state_initialize() {
     STATE[hostname]="$HOSTNAME_VALUE"
     STATE[timezone]="$TIMEZONE"
     STATE[torrent]="$TORRENT"
+    [[ "$DISTRIBUTION" != gentoo || "$MODE" != new ]] || STATE[kernel]="$KERNEL_CHOICE"
     STATE[disk_mode]="$DISK_MODE"
     if [[ "$MODE" == new && "$DISK_MODE" == prepared ]]; then
         STATE[root_partition]="$ROOT_PARTITION"
@@ -502,6 +506,10 @@ restore_globals_from_state() {
     HOSTNAME_VALUE="${STATE[hostname]:-}"
     TIMEZONE="${STATE[timezone]}"
     [[ "$TORRENT" != ask ]] || TORRENT="${STATE[torrent]:-ask}"
+    # Installations recorded before the choice existed used a custom kernel.
+    [[ "$KERNEL_CHOICE" == ask || "$KERNEL_CHOICE" == "${STATE[kernel]:-custom}" ]] ||
+        die "the kernel choice of this installation is ${STATE[kernel]:-custom}"
+    KERNEL_CHOICE="${STATE[kernel]:-custom}"
     DISK_MODE="${STATE[disk_mode]:-erase}"
     GPU_PROFILE="${STATE[gpu_profile]:-auto}"
     MACHINE_PROFILE="${STATE[machine]:-generic}"
@@ -751,6 +759,12 @@ parse_arguments() {
                 [[ "$TORRENT" == yes || "$TORRENT" == no ]] || die "--torrent requires yes or no"
                 shift 2
                 ;;
+            --kernel)
+                (($# >= 2)) || die "--kernel requires dist or custom"
+                KERNEL_CHOICE="$2"
+                [[ "$KERNEL_CHOICE" == dist || "$KERNEL_CHOICE" == custom ]] || die "--kernel requires dist or custom"
+                shift 2
+                ;;
             --non-interactive)
                 NON_INTERACTIVE=1
                 shift
@@ -844,6 +858,7 @@ validate_options() {
                 die "disk and partition options are not valid in existing mode"
             ((HOSTNAME_OPTION_SET == 0 && TIMEZONE_OPTION_SET == 0 && EFI_OPTION_SET == 0)) || \
                 die "hostname, timezone, and EFI options are not changed in existing mode"
+            [[ "$KERNEL_CHOICE" == ask ]] || die "the kernel is not changed in existing mode"
             ;;
         continue)
             ((DISK_OPTION_SET == 0 && BOOT_PARTITION_OPTION_SET == 0 && USERNAME_OPTION_SET == 0 && HOSTNAME_OPTION_SET == 0 && \
@@ -1056,6 +1071,21 @@ apply_collected_password() {
     ACCOUNT_PASSWORD=""
 }
 
+select_kernel() {
+    [[ "$DISTRIBUTION" == gentoo ]] || { [[ "$KERNEL_CHOICE" == ask ]] || die "--kernel is Gentoo-only"; return 0; }
+    if [[ "$KERNEL_CHOICE" == ask ]]; then
+        ((NON_INTERACTIVE == 0)) || die "new Gentoo installations require --kernel dist|custom"
+        local choice
+        printf 'Kernel: the distribution kernel is prebuilt, needs no configuration and updates with\nthe system. A custom kernel is configured by you in /usr/src/linux before it is built.\n'
+        choice="$(choose_number 'Kernel' 'Gentoo distribution kernel' 'Custom kernel')"
+        KERNEL_CHOICE=custom
+        [[ "$choice" != 'Gentoo distribution kernel' ]] || KERNEL_CHOICE=dist
+    fi
+    # The distribution kernel boots through UEFI entries that pass its initramfs and command line.
+    [[ "$KERNEL_CHOICE" != dist || "$CREATE_EFI_ENTRY" == yes ]] ||
+        die "the distribution kernel needs UEFI boot entries; omit --no-efi-entry"
+}
+
 select_torrent() {
     [[ "$TORRENT" == ask ]] || return 0
     ((DRY_RUN == 0)) || return 0
@@ -1122,7 +1152,7 @@ show_status() {
     fi
     state_load
     printf 'State file: %s\n' "$STATE_FILE"
-    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result hostname timezone gpu_profile machine torrent disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
+    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result hostname timezone gpu_profile machine torrent kernel disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
         [[ -z "${STATE[$key]:-}" ]] || printf '%-18s %s\n' "$key:" "${STATE[$key]}"
     done
     printf 'Stages:\n'
@@ -1135,7 +1165,7 @@ show_status() {
 print_dry_plan() {
     local stage
     printf 'DRY-RUN: no phase body will execute and no state will be written.\n'
-    printf 'distribution=%s desktop=%s filesystem=%s boot=%s repositories=%s\n' "${DISTRIBUTION:-gentoo}" "$DESKTOP" "$FILESYSTEM" "$BOOT_METHOD" "$REPOSITORIES"
+    printf 'distribution=%s desktop=%s filesystem=%s boot=%s repositories=%s kernel=%s\n' "${DISTRIBUTION:-gentoo}" "$DESKTOP" "$FILESYSTEM" "$BOOT_METHOD" "$REPOSITORIES" "$KERNEL_CHOICE"
     printf 'command=%s mode=%s tier=%s mountpoint=%s username=%s hostname=%s\n' \
         "$COMMAND" "${MODE:-unset}" "${TIER:-unset}" "$TARGET_MOUNT" "${USERNAME:-unset}" "${HOSTNAME_VALUE:-unset}"
     if [[ "$MODE" == "new" && $INTERNAL_CHROOT -eq 0 ]]; then
@@ -2070,6 +2100,7 @@ run_new_host() {
     MODE="new"
     select_distribution
     select_tier
+    select_kernel
     [[ "$DISTRIBUTION" != arch ]] || arch_select_install_options
     prompt_identity
     if ((DRY_RUN)); then
@@ -2994,6 +3025,14 @@ kernel_config_identity() {
 
 phase_kernel_config() {
     local kernel_dir identity waiting=/var/lib/install-system/kernel-config.waiting
+    [[ "$KERNEL_CHOICE" != dist ]] || return 0
+    # Install the sources once; a later --update could switch /usr/src/linux under
+    # a configuration the user has already prepared. Policy snapshots from before the
+    # kernel choice installed them with the minimal set instead.
+    if [[ -d "$PORTAGE_POLICY/kernel/custom" ]]; then
+        deploy_policy_layer kernel/custom
+        validate_policy_sets kernel/custom || install_policy_sets kernel/custom
+    fi
     if ((KERNEL_CONFIG_READY == 0)) && [[ -s "$waiting" ]] && ((NON_INTERACTIVE == 0)); then
         local answer
         read -r -p 'Have you prepared /usr/src/linux/.config manually and is it ready to compile? [y/N] ' answer </dev/tty
@@ -3021,6 +3060,7 @@ phase_kernel_config() {
 
 validate_kernel_config_stage() {
     local kernel_dir identity
+    [[ "$KERNEL_CHOICE" != dist ]] || return 0
     [[ ! -e /var/lib/install-system/kernel-config.waiting ]] || return 1
     kernel_dir="$(selected_kernel_directory)" || return 1
     identity="$(kernel_config_identity "$kernel_dir")" || return 1
@@ -3030,6 +3070,14 @@ validate_kernel_config_stage() {
 phase_kernel() {
     local kernel_dir before after makeopts
     local -a make_options=()
+    if [[ "$KERNEL_CHOICE" == dist ]]; then
+        # uefi-mkconfig reads the command line while the kernel package installs.
+        system_policy apply kernel etc/default/uefi-mkconfig
+        deploy_policy_layer kernel/dist
+        install_policy_sets kernel/dist
+        dist_kernel_installed || die "the distribution kernel and its initramfs are not on the ESP"
+        return 0
+    fi
     validate_kernel_config_stage || die "kernel config changed; resume at the manual kernel-config stage"
     kernel_dir="$(selected_kernel_directory)" || die "no selected kernel source tree"
     before="$(kernel_config_identity "$kernel_dir")"
@@ -3062,6 +3110,11 @@ kernel_modules_installed() {
 }
 
 validate_kernel() {
+    if [[ "$KERNEL_CHOICE" == dist ]]; then
+        validate_policy_sets kernel/dist && system_policy check kernel etc/default/uefi-mkconfig &&
+            dist_kernel_installed
+        return
+    fi
     validate_kernel_config_stage &&
         cmp -s /var/lib/install-system/kernel-config.approved /var/lib/install-system/kernel-build.inputs &&
         [[ -s /var/lib/install-system/bzImage && -s /var/lib/install-system/bzImage.sha256 ]] &&
@@ -3082,9 +3135,32 @@ efi_entry_exists() {
     return 1
 }
 
+dist_kernel_installed() {
+    # installkernel's efistub layout: EFI/Gentoo/vmlinuz-VERSION.efi plus its initramfs.
+    local image
+    for image in /boot/EFI/Gentoo/vmlinuz-*.efi; do
+        [[ -s "$image" ]] && efi_pe_image_is_valid "$image" || continue
+        image="${image##*/vmlinuz-}"
+        [[ -s "/boot/EFI/Gentoo/initramfs-${image%.efi}.img" ]] && return 0
+    done
+    return 1
+}
+
+dist_boot_entry_exists() {
+    local entries
+    entries="$(efibootmgr -v 2>/dev/null)" || return 1
+    grep -qiF '\EFI\Gentoo\vmlinuz-' <<<"$entries"
+}
+
 phase_boot() {
     local destination directory temporary disk_name parent_disk partition_number
     findmnt -rn -S "$BOOT_PARTITION" -T /boot >/dev/null || die "/boot is not the persisted ESP"
+    if [[ "$KERNEL_CHOICE" == dist ]]; then
+        # installkernel ran uefi-mkconfig in the kernel stage; repeat it if that failed.
+        dist_boot_entry_exists || run uefi-mkconfig
+        dist_boot_entry_exists || die "no UEFI boot entry loads the distribution kernel"
+        return 0
+    fi
     directory=/boot/EFI/BOOT
     destination="$directory/BOOTX64.EFI"
     install -d -m 0755 "$directory"
@@ -3109,6 +3185,10 @@ phase_boot() {
 }
 
 validate_boot() {
+    if [[ "$KERNEL_CHOICE" == dist ]]; then
+        dist_kernel_installed && dist_boot_entry_exists
+        return
+    fi
     [[ -s /boot/EFI/BOOT/BOOTX64.EFI ]] &&
         cmp -s /var/lib/install-system/bzImage /boot/EFI/BOOT/BOOTX64.EFI &&
         efi_pe_image_is_valid /boot/EFI/BOOT/BOOTX64.EFI || return 1

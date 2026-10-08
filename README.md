@@ -85,8 +85,9 @@ selected settings for reuse. Chezmoi manages the dotfiles; new accounts use Zsh.
 
 Prepared root and EFI partitions can be reused without formatting. Disk changes
 require confirmation. Package-tier upgrades and switching an existing account to
-Zsh also require confirmation. The Gentoo kernel must be configured manually
-before compilation.
+Zsh also require confirmation. New Gentoo installations use either Gentoo's
+prebuilt distribution kernel, which needs no configuration, or a custom kernel
+that you configure in `/usr/src/linux` before compilation.
 
 Browser setup applies themes and configures automatic extension installation for
 LibreWolf and Helium. It also runs LibreWolf's setup script.
