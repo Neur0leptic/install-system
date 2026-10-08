@@ -3764,17 +3764,9 @@ private_apply_policy() {
 }
 
 private_dotfiles_requested() {
-    [[ "$USERNAME" == neuroleptic ]] || return 1
-    local answer
-    case "$PRIVATE_DOTFILES" in
-        yes) return 0 ;;
-        no) return 1 ;;
-        ask)
-            ((NON_INTERACTIVE == 0)) || return 2
-            read -r -p 'Apply private dotfiles? [y/N] ' answer
-            [[ "$answer" =~ ^[yY]([eE][sS])?$ ]]
-            ;;
-    esac
+    # The private dotfiles belong to neuroleptic: that account gets them without a
+    # question unless --no-private-dotfiles declines; other accounts never do.
+    [[ "$USERNAME" == neuroleptic && "$PRIVATE_DOTFILES" != no ]]
 }
 
 private_dotfiles_files() {
@@ -3861,13 +3853,7 @@ phase_private_dotfiles() {
     ssh_command='ssh -o BatchMode=yes -o ClearAllForwardings=yes -o StrictHostKeyChecking=yes'
     ssh_env=(env "GIT_SSH_COMMAND=$ssh_command")
 
-    local private_request_status=0
-    private_dotfiles_requested || private_request_status=$?
-    if ((private_request_status == 2)); then
-        request_wait "choose --private-dotfiles or --no-private-dotfiles, then continue"
-        return 0
-    fi
-    if ((private_request_status != 0)); then
+    if ! private_dotfiles_requested; then
         PRIVATE_DOTFILES="no"
         STATE[private_dotfiles]="no"
         state_write
