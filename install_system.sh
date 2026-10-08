@@ -105,6 +105,7 @@ declare -a FULL_SEQUENCE=(
     full-browser-theme:phase_browser_theme:validate_browser_theme
     full-browser-extensions:phase_browser_extensions:validate_browser_extensions
     full-private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
+    wireguard:phase_wireguard:validate_wireguard
     source-apps:phase_source_apps:validate_source_apps
     binary-apps:phase_binary_apps:validate_binary_apps
     full-complete:phase_marker:validate_full_complete
@@ -2235,6 +2236,7 @@ phase_display_config() {
     mv -T "$temporary" "$root/inventory.json"
     ensure_public_dotfiles_source
     args+=(--presets "/home/$USERNAME/.local/share/chezmoi/.chezmoidata/machinePresets.json")
+    [[ "$USERNAME" != neuroleptic || "$PRIVATE_DOTFILES" == no ]] || args+=(--wireguard-profiles)
     saved="$root/chezmoi-saved.json"
     if command -v chezmoi >/dev/null && [[ -f "/home/$USERNAME/.config/chezmoi/chezmoi.toml" ]]; then
         run_as_user chezmoi dump-config --format json >"$saved"
@@ -4064,6 +4066,94 @@ validate_private_dotfiles() {
     esac
 }
 
+phase_wireguard() {
+    local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard"
+    local skipped=/var/lib/install-system/wireguard.skipped
+    [[ -x "$repo/bin/wireguard.sh" && -s "$repo/libexec/wireguard-dns.sh" ]] ||
+        die "the WireGuard scripts are missing; repeat the full-public-dotfiles stage"
+    install -d -m 0700 /etc/wireguard
+    # The boot service runs as root and reads the device from /etc/wireguard.
+    if [[ ! -e /etc/wireguard/device.json ]]; then
+        if [[ -e "$home/.config/wireguard/device.json" ]]; then
+            # Private dotfiles provide this machine's Mullvad device.
+            ln -sfn -- "$home/.config/wireguard/device.json" /etc/wireguard/device.json
+            [[ ! -e "$home/.config/wireguard/default-relay" ]] ||
+                ln -sfn -- "$home/.config/wireguard/default-relay" /etc/wireguard/default-relay
+        elif ! register_mullvad_device; then
+            printf 'no Mullvad device registered\n' | write_file "$skipped" 0644
+            return 0
+        fi
+    fi
+    rm -f -- "$skipped"
+    # Root-owned copies, as the WireGuard repository describes for its services.
+    install -m 0755 "$repo/bin/wireguard.sh" /usr/local/bin/wireguard.sh
+    install -m 0755 "$repo/libexec/wireguard-dns.sh" /usr/local/bin/wireguard-dns.sh
+    run /usr/local/bin/wireguard.sh update || log "Mullvad relay list not downloaded; the service retries at boot."
+    if [[ "$DISTRIBUTION" == arch ]]; then
+        install -m 0644 "$repo/init/systemd/wireguard-autoconnect.service" /etc/systemd/system/wireguard-autoconnect.service
+        run systemctl --root=/ enable wireguard-autoconnect.service
+    else
+        install -m 0755 "$repo/init/openrc/wireguard-autoconnect" /etc/init.d/wireguard-autoconnect
+        run rc-update add wireguard-autoconnect default
+    fi
+}
+
+register_mullvad_device() {
+    # Registers this machine as a new device of the user's Mullvad account. The account
+    # number, access token and private key never reach logs, state or command lines.
+    local account token response private name ipv4 ipv6 relay
+    ((NON_INTERACTIVE == 0)) || return 1
+    printf '\nWireGuard: register this machine as a new device of your Mullvad account (an\naccount allows five devices). Leave the account number empty to skip the VPN.\n' >/dev/tty
+    IFS= read -r -s -p 'Mullvad account number: ' account </dev/tty
+    printf '\n' >/dev/tty
+    account="${account//[[:space:]]/}"
+    [[ -n "$account" ]] || return 1
+    [[ "$account" =~ ^[0-9]{16}$ ]] || die "a Mullvad account number has 16 digits"
+    token="$(printf '{"account_number":"%s"}' "$account" |
+        curl -fsS -H 'Content-Type: application/json' --data @- https://api.mullvad.net/auth/v1/token |
+        jq -r '.access_token // empty')" || token=""
+    account=""
+    [[ -n "$token" ]] || die "Mullvad did not accept the account number"
+    private="$(wg genkey)"
+    response="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+        curl -fsS -K - -H 'Content-Type: application/json' \
+            --data "$(wg pubkey <<<"$private" | jq -Rc '{pubkey: ., hijack_dns: false}')" \
+            https://api.mullvad.net/accounts/v1/devices)" || response=""
+    token=""
+    [[ -n "$response" ]] ||
+        die "Mullvad did not register the device; an account allows five devices (see mullvad.net/account)"
+    name="$(jq -r '.name // empty' <<<"$response")"
+    ipv4="$(jq -r '.ipv4_address // empty' <<<"$response")"
+    ipv6="$(jq -r '.ipv6_address // empty' <<<"$response")"
+    [[ "$ipv4" =~ ^[0-9.]+/[0-9]+$ && "$ipv6" =~ ^[0-9a-fA-F:]+/[0-9]+$ ]] ||
+        die "Mullvad returned no tunnel addresses for the new device"
+    # The device file has the layout of the Mullvad app's own device.json.
+    jq -nR --arg name "$name" --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" \
+        '{logged_in: {device: {name: $name, wg_data: {private_key: input,
+            addresses: {ipv4_address: $ipv4, ipv6_address: $ipv6}}}}}' <<<"$private" |
+        write_file /etc/wireguard/device.json 0600
+    private=""
+    log "Registered the Mullvad device \"$name\" for this machine."
+    read -r -p 'Server for automatic connection, such as se-got-wg-001 (empty = choose in the menu): ' relay </dev/tty
+    if [[ -n "$relay" ]]; then
+        [[ "$relay" =~ ^[a-z]{2}-[a-z]{3}-wg-[0-9]{3}$ ]] || die "not a Mullvad WireGuard server name: $relay"
+        printf '%s\n' "$relay" | write_file /etc/wireguard/default-relay 0600
+    fi
+}
+
+validate_wireguard() {
+    local services
+    [[ ! -s /var/lib/install-system/wireguard.skipped ]] || return 0
+    [[ -e /etc/wireguard/device.json && -x /usr/local/bin/wireguard.sh && -x /usr/local/bin/wireguard-dns.sh ]] ||
+        return 1
+    if [[ "$DISTRIBUTION" == arch ]]; then
+        systemctl --root=/ is-enabled --quiet wireguard-autoconnect.service
+    else
+        services="$(rc-update show default)" || return 1
+        [[ " $(awk '{print $1}' <<<"$services" | tr '\n' ' ') " == *" wireguard-autoconnect "* ]]
+    fi
+}
+
 validate_dwl_complete() {
     [[ -s /var/lib/install-system/dwl-complete ]] || return 1
     if [[ "$MODE" == "new" ]]; then
@@ -4545,6 +4635,7 @@ configure_sequences() {
             full-browser-theme:phase_browser_theme:validate_browser_theme
             full-browser-extensions:phase_browser_extensions:validate_browser_extensions
             full-private-dotfiles:phase_private_dotfiles:validate_private_dotfiles
+            wireguard:phase_wireguard:validate_wireguard
             full-complete:phase_marker:arch_validate_full_complete
         )
     fi

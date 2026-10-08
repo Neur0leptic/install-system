@@ -92,6 +92,10 @@ that you configure in `/usr/src/linux` before compilation.
 Browser setup applies themes and configures automatic extension installation for
 LibreWolf and Helium. It also runs LibreWolf's setup script.
 
+In the full tier, the installer can register the machine as a new device of your
+Mullvad account for the WireGuard scripts. The account number is used once and is
+never stored or logged.
+
 ## Related repositories
 
 - [Gentoo packages and policy](https://github.com/Neur0leptic/neurogentoo)

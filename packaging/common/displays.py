@@ -115,7 +115,7 @@ def choose_mouse(inventory, current, read, report):
     return device_name(answer)
 
 
-def prompt(inventory, defaults=None, read=input, report=print):
+def prompt(inventory, defaults=None, read=input, report=print, ask_wireguard=False):
     defaults = defaults or {}
     detected = inventory.get('outputs', [])
     report('Press Enter to accept the suggestion in brackets.')
@@ -180,10 +180,14 @@ def prompt(inventory, defaults=None, read=input, report=print):
     default = settings.get('backlight', '')
     answer = read(f'Backlight device (empty = automatic) (- clears optional fields) [{default}]: ') or default
     settings['backlight'] = '' if answer == '-' else answer
-    # VPN identity is deliberately not inferred from the physical-machine preset.
-    default = settings.get('wireguardProfile', '')
-    answer = read(f'WireGuard device profile suffix, if already provisioned (- = none) [{default}]: ') or default
-    settings['wireguardProfile'] = '' if answer == '-' else answer
+    # VPN identity is deliberately not inferred from the physical-machine preset. Named
+    # profiles come from the private dotfiles; other accounts register a device later.
+    if ask_wireguard:
+        default = settings.get('wireguardProfile', '')
+        answer = read(f'WireGuard profile from the private dotfiles (- = none) [{default}]: ') or default
+        settings['wireguardProfile'] = '' if answer == '-' else answer
+    else:
+        settings['wireguardProfile'] = ''
     result = normalize(settings)
     report(json.dumps(result, indent=2))
     if read('Use these display settings? [y/N]: ').lower() not in ('y', 'yes'):
@@ -199,6 +203,7 @@ def main():
     parser.add_argument('--check-hardware', action='store_true')
     parser.add_argument('--input', type=Path)
     parser.add_argument('--check-target', type=Path)
+    parser.add_argument('--wireguard-profiles', action='store_true')
     args = parser.parse_args()
     if args.input:
         result = normalize(json.loads(args.input.read_text()))
@@ -228,7 +233,7 @@ def main():
                         if read(f'Hardware matches the {name} preset. Use its preferences as suggestions? [y/N]: ').lower() in ('y', 'yes'):
                             defaults = preset['settings']
                         break
-            result = prompt(inventory, defaults, read, report)
+            result = prompt(inventory, defaults, read, report, args.wireguard_profiles)
     if args.check_hardware:
         from hardware import probe
         current = probe()
