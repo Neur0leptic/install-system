@@ -9,6 +9,11 @@ import re
 import sys
 
 
+def device_name(name):
+    # DWL and Hyprland match input devices by name, lower-cased with hyphens for spaces.
+    return ''.join('-' if c == ' ' else c.lower() if 'A' <= c <= 'Z' else c for c in name)
+
+
 def normalize(value):
     fields = {'schema', 'outputs', 'machine', 'renderer', 'renderDevice', 'vaapi', 'keyboardLayout',
               'keyboardOptions', 'mouse', 'sensitivity', 'backlight', 'wireguardProfile'}
@@ -56,9 +61,15 @@ def normalize(value):
         settings[key] = value.get(key, default)
     if settings['renderer'] not in ('auto', 'gles2', 'vulkan') or settings['vaapi'] not in ('auto', 'i965', 'iHD', 'radeonsi', 'nvidia'):
         raise ValueError('invalid renderer or video acceleration driver')
-    for key in ('keyboardLayout', 'keyboardOptions', 'mouse', 'backlight', 'wireguardProfile'):
+    for key in ('keyboardLayout', 'keyboardOptions', 'backlight', 'wireguardProfile'):
         if not isinstance(settings[key], str) or not re.fullmatch(r'[A-Za-z0-9_:+,.-]*', settings[key]):
             raise ValueError(f'invalid {key}')
+    # Device names may contain slashes and parentheses, as in "TPPS/2 IBM TrackPoint".
+    if not isinstance(settings['mouse'], str):
+        raise ValueError('invalid mouse')
+    settings['mouse'] = device_name(settings['mouse'])
+    if not re.fullmatch(r'[a-z0-9_:+,./()-]*', settings['mouse']):
+        raise ValueError('invalid mouse')
     if not settings['keyboardLayout']:
         raise ValueError('keyboard layout must not be empty')
     if not re.fullmatch(r'(?:/dev/dri/(?:by-path/[A-Za-z0-9_:.-]+|renderD[0-9]+))?', settings['renderDevice']):
@@ -66,6 +77,26 @@ def normalize(value):
     if type(settings['sensitivity']) not in (int, float) or not math.isfinite(settings['sensitivity']) or not -1 <= settings['sensitivity'] <= 1:
         raise ValueError('mouse sensitivity must be between -1 and 1')
     return settings
+
+
+def choose_mouse(inventory, current, read, report):
+    detected = [device_name(name) for name in inventory.get('pointers', [])]
+    report('Pointing devices (one can get its own sensitivity; the others keep the default):')
+    for number, name in enumerate(detected, 1):
+        report(f'  {number}) {name}')
+    if not detected:
+        report('  none detected')
+    answer = read(f'Mouse with its own sensitivity: number, name, or - for none [{current or "none"}]: ')
+    if not answer:
+        return current
+    if answer == '-':
+        return ''
+    if answer.isdigit():
+        if not 1 <= int(answer) <= len(detected):
+            raise ValueError('no pointing device has that number')
+        return detected[int(answer) - 1]
+    # A name also covers a mouse that is not connected during installation.
+    return device_name(answer)
 
 
 def prompt(inventory, defaults=None, read=input, report=print):
@@ -118,15 +149,17 @@ def prompt(inventory, defaults=None, read=input, report=print):
     vaapi = settings.get('vaapi', 'i965' if families == ['intel-legacy'] else 'auto')
     settings['vaapi'] = read(f'VA-API driver [auto/i965/iHD/radeonsi/nvidia; {vaapi}]: ') or vaapi
     for key, label, default in [('keyboardLayout', 'Keyboard layouts, comma-separated', 'us'),
-                                ('keyboardOptions', 'XKB options', 'grp:alt_shift_toggle'),
-                                ('mouse', 'Optional mouse name (lowercase, spaces as hyphens; empty = default)', ''),
-                                ('backlight', 'Backlight device (empty = automatic)', '')]:
+                                ('keyboardOptions', 'XKB options', 'grp:alt_shift_toggle')]:
         default = settings.get(key, default)
         answer = read(f'{label} (- clears optional fields) [{default}]: ') or default
         settings[key] = '' if answer == '-' else answer
+    settings['mouse'] = choose_mouse(inventory, settings.get('mouse', ''), read, report)
     if settings['mouse']:
         default = settings.get('sensitivity', 0)
         settings['sensitivity'] = float(read(f'Mouse sensitivity -1 to 1 [{default}]: ') or default)
+    default = settings.get('backlight', '')
+    answer = read(f'Backlight device (empty = automatic) (- clears optional fields) [{default}]: ') or default
+    settings['backlight'] = '' if answer == '-' else answer
     # VPN identity is deliberately not inferred from the physical-machine preset.
     default = settings.get('wireguardProfile', '')
     answer = read(f'WireGuard device profile suffix, if already provisioned (- = none) [{default}]: ') or default

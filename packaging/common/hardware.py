@@ -30,6 +30,24 @@ def text(path):
         return ''
 
 
+def input_bits(path):
+    words = text(path).split()
+    return int(words[-1], 16) if words else 0
+
+
+def pointers(sysfs):
+    # Mice and pointing sticks report relative X/Y. Touchpads report absolute X/Y
+    # with the pointer property but without the direct (touchscreen) property.
+    names = []
+    for device in sorted((sysfs / 'class/input').glob('event*/device')):
+        relative = input_bits(device / 'capabilities/rel') & 3 == 3
+        touchpad = input_bits(device / 'capabilities/abs') & 3 == 3 and input_bits(device / 'properties') & 3 == 1
+        name = text(device / 'name')
+        if (relative or touchpad) and name and name not in names:
+            names.append(name)
+    return names
+
+
 def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
     cpus = len(os.sched_getaffinity(0))
     memory_match = re.search(r'^MemTotal:\s+(\d+)', text(proc / 'meminfo'), re.M)
@@ -70,7 +88,8 @@ def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
             'firmware_use': 'savedconfig' if saved else '-savedconfig', 'sof': sof,
             'cpu_vendor': vendor, 'gpus': gpus, 'outputs': outputs,
             'machine': {key: text(sysfs / 'class/dmi/id' / key) for key in ('sys_vendor', 'product_name', 'product_version')},
-            'backlights': [p.name for p in sorted((sysfs / 'class/backlight').glob('*'))]}
+            'backlights': [p.name for p in sorted((sysfs / 'class/backlight').glob('*'))],
+            'pointers': pointers(sysfs)}
 
 
 def choose(plan, requested, read=input):
@@ -193,7 +212,7 @@ def main():
         raise ValueError('unsupported hardware settings')
     if args.action == 'refresh-displays':
         current = probe()
-        for key in ('outputs', 'backlights', 'machine'):
+        for key in ('outputs', 'backlights', 'machine', 'pointers'):
             plan[key] = current[key]
         print(json.dumps(plan, sort_keys=True, indent=2))
     elif args.action == 'render':
