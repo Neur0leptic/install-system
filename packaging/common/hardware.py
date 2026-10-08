@@ -196,10 +196,11 @@ def main():
         def answer(message):
             if args.non_interactive:
                 raise ValueError(message + 'supply --graphics to the installer')
-            with open('/dev/tty', 'r+') as tty:
-                tty.write(message)
-                tty.flush()
-                return tty.readline()
+            # A terminal cannot seek, so it gets separate read and write streams ('r+' fails).
+            with open('/dev/tty') as tty_in, open('/dev/tty', 'w') as tty_out:
+                tty_out.write(message)
+                tty_out.flush()
+                return tty_in.readline()
         plan = probe(root=Path('/') if args.existing else None) if args.action == 'probe' else json.loads(args.plan.read_text())
         if args.no_graphics:
             plan['graphics'] = {'families': [], 'profile': 'auto'}

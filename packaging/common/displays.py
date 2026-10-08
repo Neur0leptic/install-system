@@ -208,17 +208,18 @@ def main():
     if args.input:
         result = normalize(json.loads(args.input.read_text()))
     else:
-        with open('/dev/tty', 'r+') as tty:
+        # A terminal cannot seek, so it gets separate read and write streams ('r+' fails).
+        with open('/dev/tty') as tty_in, open('/dev/tty', 'w') as tty_out:
             def read(message):
-                tty.write(message)
-                tty.flush()
-                answer = tty.readline()
+                tty_out.write(message)
+                tty_out.flush()
+                answer = tty_in.readline()
                 if not answer:
                     raise ValueError('display prompt reached EOF')
                 return answer.strip()
             def report(message):
-                tty.write(message + '\n')
-                tty.flush()
+                tty_out.write(message + '\n')
+                tty_out.flush()
             inventory = json.loads(args.inventory.read_text())
             defaults = {}
             if args.saved and args.saved.is_file():
