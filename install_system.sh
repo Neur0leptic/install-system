@@ -4893,6 +4893,9 @@ collect_private_answers() {
         fi
         [[ -z "$SSH_KEY" ]] && ! private_ssh_key_is_safe "/home/$USERNAME/.ssh/id_ed25519_github" &&
             ! run_as_user ssh-add -l >/dev/null 2>&1 || return 0
+        # Checking the key reaches GitHub, which a client without RSA support refuses
+        # until the desktop policy's SSH setting is in place, so it is applied first.
+        [[ "$DISTRIBUTION" != gentoo ]] || ssh_client_reads_rsa || system_policy apply dwl "$SSH_CLIENT_POLICY"
         ensure_github_known_host
         create_github_ssh_key || true
     elif [[ ! -f "$(github_key_handoff)/id_ed25519_github" ]]; then
