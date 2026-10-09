@@ -49,7 +49,7 @@ readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
 # at the end, and continue retries them. Whole layers outside the application sets
 # (repository tools, hardware, kernel, base system) count as core as well.
 readonly GENTOO_CORE_PACKAGES=" app-admin/chezmoi app-admin/doas app-crypt/gnupg app-eselect/eselect-repository app-misc/jq app-shells/zsh dev-lang/python dev-vcs/git gui-apps/foot gui-wm/dwl media-libs/fontconfig net-misc/curl net-misc/openssh sys-apps/dbus sys-apps/shadow sys-auth/pam_xdg sys-auth/seatd "
-readonly -a HOST_TOOLS=(blkid chroot cmp curl findmnt flock git gpg gpgv lsblk mkfs.f2fs mkfs.vfat mount mountpoint parted partprobe python3 readlink sha256sum sha512sum tar udevadm umount wipefs xz)
+readonly -a HOST_TOOLS=(blkid chroot cmp curl findmnt flock git gpg gpgv lsblk mkfs.f2fs mkfs.vfat mount mountpoint parted partprobe python3 readlink sha256sum sha512sum tar udevadm umount unshare wipefs xz)
 
 
 declare -a HOST_SEQUENCE=(
@@ -115,8 +115,10 @@ declare -a FULL_SEQUENCE=(
     binary-apps:phase_binary_apps:validate_binary_apps
     full-complete:phase_marker:validate_full_complete
 )
+# Stages that run last, just before the selected tier is marked complete.
+declare -a FINAL_SEQUENCE=()
 # Preserve the Gentoo sequences when loading a different distribution's state.
-for group in HOST MINIMAL EXISTING DWL FULL; do
+for group in HOST MINIMAL EXISTING DWL FULL FINAL; do
     declare -a "GENTOO_${group}_SEQUENCE=()" "${group}_STAGES=()"
     declare -n sequence="${group}_SEQUENCE" saved="GENTOO_${group}_SEQUENCE"
     saved=("${sequence[@]}")
@@ -303,6 +305,18 @@ run() {
     "$@"
 }
 
+run_public() {
+    # For commands that install or configure the system: what they create gets the usual
+    # 0755/0644, which users and services need (pacstrap creates /etc with mkdir -p, for
+    # example). The installer's own records stay private under its default umask 077.
+    local previous status=0
+    previous="$(umask)"
+    umask 022
+    run "$@" || status=$?
+    umask "$previous"
+    return "$status"
+}
+
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
@@ -336,7 +350,7 @@ root_lock_file_is_safe() {
 }
 
 valid_state_key() {
-    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|kernel|disk_mode|private_dotfiles|gpg_recipient|wireguard|wireguard_relay|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
+    [[ "$1" =~ ^(mode|tier|distribution|desktop|filesystem|boot_method|repositories|arch_cpu|arch_graphics|arch_isa|arch_sof|arch_outputs|arch_policy_ref|username|user_shell|librewolf_setup_result|first_snapshot|hostname|timezone|gpu_profile|machine|system_id|policy_ref|compiler_policy|feature_mail|feature_keepass|feature_wireguard|torrent|kernel|disk_mode|private_dotfiles|gpg_recipient|wireguard|wireguard_relay|disk|disk_serial|disk_wwn|disk_ptuuid|boot_partition|root_partition|boot_uuid|root_uuid|boot_partuuid|root_partuuid|stage_sha512|stage_path|efi_entry|approval\.(minimal-to-dwl|dwl-to-full|minimal-to-desktop|desktop-to-full|user-shell)|stage\.[a-z0-9-]+)$ ]]
 }
 
 valid_state_value() {
@@ -1153,11 +1167,15 @@ list_stages() {
     for stage in "${DWL_STAGES[@]}"; do printf '  %s\n' "$stage"; done
     printf 'Full System stages:\n'
     for stage in "${FULL_STAGES[@]}"; do printf '  %s\n' "$stage"; done
+    if ((${#FINAL_STAGES[@]})); then
+        printf 'Final new-install stages (before the selected tier is complete):\n'
+        for stage in "${FINAL_STAGES[@]}"; do printf '  %s\n' "$stage"; done
+    fi
 }
 
 stage_exists() {
     local wanted="$1" stage
-    for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
+    for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}" "${FINAL_STAGES[@]}"; do
         [[ "$stage" == "$wanted" ]] && return 0
     done
     return 1
@@ -1166,7 +1184,7 @@ stage_exists() {
 stage_allowed_for_target() {
     local wanted="$1" stage
     if [[ "$MODE" == "new" ]]; then
-        for stage in "${MINIMAL_STAGES[@]}"; do [[ "$stage" == "$wanted" ]] && return 0; done
+        for stage in "${MINIMAL_STAGES[@]}" "${FINAL_STAGES[@]}"; do [[ "$stage" == "$wanted" ]] && return 0; done
     else
         for stage in "${EXISTING_STAGES[@]}"; do [[ "$stage" == "$wanted" ]] && return 0; done
     fi
@@ -1196,12 +1214,12 @@ show_status() {
     fi
     state_load
     printf 'State file: %s\n' "$STATE_FILE"
-    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result hostname timezone gpu_profile machine torrent kernel disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
+    for key in distribution mode tier desktop filesystem boot_method repositories arch_cpu arch_graphics arch_isa username user_shell librewolf_setup_result first_snapshot hostname timezone gpu_profile machine torrent kernel disk_mode system_id policy_ref arch_policy_ref compiler_policy disk disk_ptuuid boot_partition root_partition root_uuid boot_uuid boot_partuuid root_partuuid stage_path stage_sha512 approval.minimal-to-dwl approval.dwl-to-full approval.minimal-to-desktop approval.desktop-to-full approval.user-shell; do
         [[ -z "${STATE[$key]:-}" ]] || printf '%-18s %s\n' "$key:" "${STATE[$key]}"
     done
     printf 'Stages:\n'
     # An unset final stage must not become the function's (failing) exit status.
-    for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
+    for stage in "${HOST_STAGES[@]}" "${MINIMAL_STAGES[@]}" "${EXISTING_STAGES[@]}" "${DWL_STAGES[@]}" "${FULL_STAGES[@]}" "${FINAL_STAGES[@]}"; do
         [[ -z "${STATE["stage.$stage"]:-}" ]] || printf '  %-24s %s\n' "$stage" "${STATE["stage.$stage"]}"
     done
     if [[ -s "$(missing_packages_file)" ]]; then
@@ -1226,6 +1244,9 @@ print_dry_plan() {
     fi
     for stage in "${DWL_STAGES[@]}"; do printf '[dry-run] %s\n' "$stage"; done
     for stage in "${FULL_STAGES[@]}"; do printf '[dry-run] %s\n' "$stage"; done
+    if [[ "$MODE" == new ]]; then
+        for stage in "${FINAL_STAGES[@]}"; do printf '[dry-run] %s (before the selected tier is complete)\n' "$stage"; done
+    fi
 }
 
 write_file() {
@@ -1240,7 +1261,8 @@ write_file() {
     cat >"$tmp"
     chmod "$mode" "$tmp"
     chown root:root "$tmp"
-    if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    if [[ -f "$path" && ! -L "$path" ]] && cmp -s "$tmp" "$path" &&
+        [[ "$(stat -c '%a:%u:%g' "$tmp")" == "$(stat -c '%a:%u:%g' "$path")" ]]; then
         rm -f "$tmp"
     else
         mv -fT -- "$tmp" "$path"
@@ -1885,14 +1907,15 @@ validate_stage3() {
 mount_target_boot() {
     local existing_target destination="$TARGET_MOUNT/boot"
     [[ "$DISTRIBUTION" != arch ]] || destination="$TARGET_MOUNT/efi"
-    install -d -m 0755 "$destination"
+    [[ "$(readlink -m "$destination")" == "$destination" ]] || die "target ESP path must not contain symlinks"
     while IFS= read -r existing_target; do
         [[ "$existing_target" == "$destination" ]] || die "persisted ESP is mounted elsewhere: $existing_target"
     done < <(findmnt -rn -S "$BOOT_PARTITION" -o TARGET 2>/dev/null || true)
     if mountpoint -q "$destination"; then
-        findmnt -rn -S "$BOOT_PARTITION" -T "$destination" >/dev/null || die "wrong filesystem mounted at target ESP"
+        findmnt -rn -S "$BOOT_PARTITION" -M "$destination" >/dev/null || die "wrong filesystem mounted at target ESP"
         return 0
     fi
+    install -d -m 0755 "$destination"
     run mount "$BOOT_PARTITION" "$destination"
     remember_mount "$destination"
 }
@@ -1909,7 +1932,7 @@ phase_target_setup() {
         run cp -- "$TARGET_MOUNT/usr/share/portage/config/repos.conf" "$repository_config"
     fi
     if [[ ! -s "$TARGET_MOUNT/etc/resolv.conf" && ! -L "$TARGET_MOUNT/etc/resolv.conf" ]]; then
-        run cp -L /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
+        run install -m 0644 /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
         system_policy seed minimal --root "$TARGET_MOUNT" etc/resolv.conf
     fi
     install -d -m 0755 "$TARGET_MOUNT/usr/local/sbin"
@@ -1927,6 +1950,7 @@ validate_target_setup() {
 
 mount_one_chroot_fs() {
     local kind="$1" source="$2" target="$3"
+    [[ -d "$target" && "$(readlink -m "$target")" == "$target" ]] || die "unsafe or missing chroot mount directory: $target"
     if mountpoint -q "$target"; then
         if [[ "$kind" == "proc" ]]; then
             [[ "$(findmnt -rn -o FSTYPE -T "$target")" == "proc" ]] || die "wrong filesystem mounted at $target"
@@ -1936,16 +1960,24 @@ mount_one_chroot_fs() {
         else
             [[ "$(stat -Lc '%d:%i' "$source")" == "$(stat -Lc '%d:%i' "$target")" ]] || die "wrong bind source mounted at $target"
         fi
+        # Resumed mounts must not propagate repaired child mounts to the live system.
+        case "$kind" in
+            rbind) run mount --make-rslave "$target" ;;
+            bind) run mount --make-slave "$target" ;;
+            proc|tmpfs) run mount --make-private "$target" ;;
+        esac
         return 0
     fi
     case "$kind" in
         tmpfs)
             run mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$target"
             remember_mount "$target"
+            run mount --make-private "$target"
             ;;
         proc)
             run mount -t proc "$source" "$target"
             remember_mount "$target"
+            run mount --make-private "$target"
             ;;
         rbind)
             run mount --rbind "$source" "$target"
@@ -1962,9 +1994,22 @@ mount_one_chroot_fs() {
 }
 
 phase_chroot_mounts() {
+    local source
+    [[ "$(findmnt -rn -o FSTYPE -M /dev/pts 2>/dev/null)" == devpts &&
+       -c /dev/ptmx && -c /dev/pts/ptmx ]] ||
+        die "the live system has no working /dev/pts; run 'mount -t devpts devpts /dev/pts -o gid=5,mode=620' or restart the live system, then continue"
     mount_one_chroot_fs proc /proc "$TARGET_MOUNT/proc"
     mount_one_chroot_fs rbind /sys "$TARGET_MOUNT/sys"
     mount_one_chroot_fs rbind /dev "$TARGET_MOUNT/dev"
+    # A failed recursive unmount can leave /dev bound but remove its devpts child.
+    mount_one_chroot_fs bind /dev/pts "$TARGET_MOUNT/dev/pts"
+    validate_chroot_devpts || die "target /dev/pts or /dev/ptmx is unavailable; repair the chroot mounts before continuing"
+    # Recursive unmounts can also remove these children while leaving /dev or /sys bound.
+    for source in /dev/shm /sys/firmware/efi/efivars; do
+        if [[ ! -L "$source" ]] && mountpoint -q "$source"; then
+            mount_one_chroot_fs bind "$source" "$TARGET_MOUNT$source"
+        fi
+    done
     if [[ "$DISTRIBUTION" == arch ]]; then
         mount_one_chroot_fs tmpfs /run "$TARGET_MOUNT/run"
     else
@@ -1972,10 +2017,32 @@ phase_chroot_mounts() {
     fi
 }
 
+validate_chroot_devpts() {
+    [[ "$(readlink -m "$TARGET_MOUNT/dev/pts")" == "$TARGET_MOUNT/dev/pts" &&
+       "$(findmnt -rn -o FSTYPE -M "$TARGET_MOUNT/dev/pts" 2>/dev/null)" == devpts &&
+       "$(stat -Lc '%d:%i' /dev/pts)" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT/dev/pts")" ]] &&
+        chroot "$TARGET_MOUNT" /usr/bin/env -i /bin/bash -c '[[ -c /dev/ptmx && -c /dev/pts/ptmx ]]'
+}
+
 validate_chroot_mounts() {
-    [[ "$(findmnt -rn -o FSTYPE -T "$TARGET_MOUNT/proc" 2>/dev/null)" == "proc" ]] &&
+    local path source propagation
+    local -a paths=(/proc /sys /dev /dev/pts /run)
+    for source in /dev/shm /sys/firmware/efi/efivars; do
+        if [[ ! -L "$source" ]] && mountpoint -q "$source"; then
+            paths+=("$source")
+            [[ "$(stat -Lc '%d:%i' "$source")" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT$source")" ]] || return 1
+        fi
+    done
+    for path in "${paths[@]}"; do
+        [[ -d "$TARGET_MOUNT$path" && "$(readlink -m "$TARGET_MOUNT$path")" == "$TARGET_MOUNT$path" ]] &&
+            mountpoint -q "$TARGET_MOUNT$path" || return 1
+        propagation="$(findmnt -rn -o PROPAGATION -M "$TARGET_MOUNT$path")" || return 1
+        [[ ",$propagation," != *,shared,* ]] || return 1
+    done
+    [[ "$(findmnt -rn -o FSTYPE -M "$TARGET_MOUNT/proc" 2>/dev/null)" == "proc" ]] &&
         [[ "$(stat -Lc '%d:%i' /sys)" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT/sys")" ]] &&
         [[ "$(stat -Lc '%d:%i' /dev)" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT/dev")" ]] || return 1
+    validate_chroot_devpts || return 1
     if [[ "$DISTRIBUTION" == arch ]]; then
         [[ "$(findmnt -rn -o FSTYPE -M "$TARGET_MOUNT/run")" == tmpfs &&
            "$(stat -Lc '%d:%i' /run)" != "$(stat -Lc '%d:%i' "$TARGET_MOUNT/run")" ]]
@@ -2001,7 +2068,12 @@ phase_chroot_install() {
     local completion key status=0
     chroot_argument_array
     prepare_credentials "$TARGET_MOUNT"
-    chroot "$TARGET_MOUNT" /usr/bin/env -i \
+    # The target runs in its own PID namespace, so daemons it starts (gpg-agent, dirmngr,
+    # a browser) end with the installer instead of keeping the target busy. A shell outside
+    # the target is the namespace's first process, so tools in the target still see a
+    # chroot, and the namespace's own /proc keeps process tools such as killall working.
+    unshare --fork --pid --kill-child --mount-proc="$TARGET_MOUNT/proc" \
+        /bin/sh -c '"$@"; exit "$?"' sh chroot "$TARGET_MOUNT" /usr/bin/env -i \
         HOME=/root TERM="${TERM:-linux}" INSTALL_SYSTEM_CHROOT=1 INSTALL_SYSTEM_CREDENTIALS=1 \
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         /bin/bash /usr/local/sbin/install-system "${CHROOT_ARGS[@]}" 3< <(printf '%s\0%s\0' "$ACCOUNT_PASSWORD" "$MULLVAD_ACCOUNT") || status=$?
@@ -4066,26 +4138,77 @@ validate_librewolf_setup_outputs() {
     [[ -x "$profile/updater.sh" && -x "$profile/prefsCleaner.sh" ]]
 }
 
+librewolf_profile() { # check|create
+    # As the target user. "check" succeeds when ~/.librewolf/profiles.ini names an existing
+    # default profile, read the way the unchanged setup script reads it. "create" starts
+    # LibreWolf headless until that is true, at most 30 seconds, and stops it again.
+    # LibreWolf now puts new profiles under ~/.config/librewolf/librewolf unless
+    # ~/.librewolf already has one; MOZ_LEGACY_HOME=1 keeps them in ~/.librewolf.
+    run_as_user env MOZ_LEGACY_HOME=1 /bin/bash -c '
+        ready() {
+            local profile
+            profile="$(sed -n "/^\[Install/,/^\[/{/^Default=/{s/^Default=//p;q}}" "$HOME/.librewolf/profiles.ini" 2>/dev/null)" &&
+                [[ -n "$profile" && -d "$HOME/.librewolf/$profile" ]]
+        }
+        [[ "$1" == create ]] || { ready; exit; }
+        librewolf --headless --no-remote &
+        browser=$!
+        for ((tries = 0; tries < 300; tries++)); do
+            ready && break
+            kill -0 "$browser" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill "$browser" 2>/dev/null
+        for ((tries = 0; tries < 100; tries++)); do
+            kill -0 "$browser" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL "$browser" 2>/dev/null
+        wait "$browser"
+        ready' bash "$1"
+}
+
 phase_librewolf_setup() {
-    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" result answer
+    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" home="/home/$USERNAME" result answer output
     ! missing_for_stage www-client/librewolf || return 0
     [[ -x "$script" ]] || die "managed LibreWolf setup script is missing"
     if [[ "${STATE[librewolf_setup_result]:-}" == failed && "${FORCE_STAGE:-}" != librewolf-setup ]]; then
         if validate_librewolf_setup_outputs && ((NON_INTERACTIVE == 0)); then
-            read -r -p 'Did the unchanged LibreWolf setup script succeed when you reran it manually? [y/N] ' answer
+            read -r -p 'Did the LibreWolf/Arkenfox setup succeed when you completed it manually? [y/N] ' answer
             if [[ "$answer" =~ ^[yY]([eE][sS])?$ ]]; then
                 state_set librewolf_setup_result success
                 log "LibreWolf setup: manual success confirmed; existing profile retained."
                 return 0
             fi
         fi
-        request_wait "LibreWolf setup failed previously; rerun $script as $USERNAME and confirm success on resume, or select librewolf-setup to retry it"
+        request_wait "LibreWolf setup failed previously; complete it as $USERNAME (for example by rerunning $script) and confirm on resume, or select librewolf-setup to retry it"
         return 0
+    fi
+    # The unchanged script needs a profile in ~/.librewolf; a first start creates it there.
+    if ! librewolf_profile check; then
+        if [[ "$MODE" == existing && ! -e "$home/.librewolf/profiles.ini" &&
+              -e "$home/.config/librewolf/librewolf/profiles.ini" ]]; then
+            # LibreWolf would switch this account to a new, empty profile in ~/.librewolf.
+            state_set librewolf_setup_result failed
+            request_wait "LibreWolf keeps $USERNAME's existing profile in ~/.config/librewolf/librewolf, which the unchanged setup script does not use; apply Arkenfox to that profile yourself, then continue and confirm it"
+            return 0
+        fi
+        run_as_user /bin/bash -c 'command -v librewolf' >/dev/null || die "LibreWolf is not installed"
+        log "Starting LibreWolf once as $USERNAME to create its profile in ~/.librewolf."
+        output="$(mktemp)"
+        if ! librewolf_profile create >"$output" 2>&1; then
+            warn "LibreWolf did not create a profile within 30 seconds. Its output:"
+            tail -n 20 -- "$output" >&2
+            rm -f -- "$output"
+            request_wait "LibreWolf could not create a profile for $USERNAME; fix the problem shown above, then continue"
+            return 0
+        fi
+        rm -f -- "$output"
     fi
     # Interruptions and explicit retries must not retain a previous success result.
     state_set librewolf_setup_result failed
     log "Calling the unchanged LibreWolf/Arkenfox setup script as $USERNAME."
-    if run_as_user "$script"; then
+    if run_as_user env MOZ_LEGACY_HOME=1 "$script"; then
         if validate_librewolf_setup_outputs; then
             state_set librewolf_setup_result success
             log "LibreWolf setup: SUCCESS (exit status 0)."
@@ -4437,7 +4560,7 @@ phase_wireguard() {
     run /usr/local/bin/wireguard.sh update || log "Mullvad relay list not downloaded; the service retries at boot."
     if [[ "$DISTRIBUTION" == arch ]]; then
         install -m 0644 "$repo/init/systemd/wireguard-autoconnect.service" /etc/systemd/system/wireguard-autoconnect.service
-        run systemctl --root=/ enable wireguard-autoconnect.service
+        run_public systemctl --root=/ enable wireguard-autoconnect.service
     else
         install -m 0755 "$repo/init/openrc/wireguard-autoconnect" /etc/init.d/wireguard-autoconnect
         run rc-update add wireguard-autoconnect default
@@ -5156,7 +5279,7 @@ run_continue() {
 
 configure_sequences() {
     local distribution="$1" group entry
-    for group in HOST MINIMAL EXISTING DWL FULL; do
+    for group in HOST MINIMAL EXISTING DWL FULL FINAL; do
         local -n current="${group}_SEQUENCE" original="GENTOO_${group}_SEQUENCE"
         current=("${original[@]}")
         unset -n current original
@@ -5180,10 +5303,12 @@ configure_sequences() {
             accounts:arch_accounts:arch_validate_accounts
             account-shell:phase_user_shell:validate_user_shell
             aur-helper:arch_yay:arch_validate_yay
-            snapshots:arch_snapshots:arch_validate_snapshots
             boot:arch_boot:arch_validate_boot
             minimal-complete:phase_marker:validate_minimal_complete
         )
+        # Snapper starts once the selected tier is installed: installing takes no
+        # snapshots, and the first one shows the finished system.
+        FINAL_SEQUENCE=(snapshots:arch_snapshots:arch_validate_snapshots)
         EXISTING_SEQUENCE=(
             existing-preflight:arch_existing_preflight:arch_validate_existing
             aur-helper:arch_yay:arch_validate_yay
@@ -5211,7 +5336,7 @@ configure_sequences() {
             full-complete:phase_marker:arch_validate_full_complete
         )
     fi
-    for group in HOST MINIMAL EXISTING DWL FULL; do
+    for group in HOST MINIMAL EXISTING DWL FULL FINAL; do
         local -n sequence="${group}_SEQUENCE" stages="${group}_STAGES"
         stages=()
         for entry in "${sequence[@]}"; do stages+=("${entry%%:*}"); done
@@ -5522,6 +5647,12 @@ arch_user_command() {
     # AUR builds keep a terminal for interactive makepkg/yay prompts.
     local cpus memory jobs
     user_home_is_safe || die "unsafe target home"
+    if ! run_as_user /bin/bash -c '[[ -r /etc/pacman.conf && -r /etc/resolv.conf ]]'; then
+        die "cannot read /etc/pacman.conf or /etc/resolv.conf as $USERNAME; check file and directory permissions, then continue"
+    fi
+    if ! run_as_user /usr/bin/python3 -I -c 'import os; master, slave = os.openpty(); os.close(slave); os.close(master)'; then
+        die "cannot allocate a PTY as $USERNAME; check /dev/pts, /dev/ptmx and directory permissions, then continue"
+    fi
     cpus="$(nproc)"
     memory="$(awk '/^MemTotal:/ {print int(($2 - 1048576) / 2097152)}' /proc/meminfo)"
     jobs=$((memory < cpus ? memory : cpus))
@@ -5540,7 +5671,7 @@ arch_install_lists() {
         if [[ "${FORCE_STAGE:-none}" != "$CURRENT_STAGE" ]] && pacman -Qk "$package" >/dev/null 2>&1; then continue; fi
         if pacman -Si "$package" >/dev/null 2>&1; then native+=("$package"); else aur+=("$package"); fi
     done <<<"$packages"
-    ((${#native[@]} == 0)) || run pacman -S --noconfirm "${native[@]}"
+    ((${#native[@]} == 0)) || run_public pacman -S --noconfirm "${native[@]}"
     if ((${#aur[@]})); then
         command -v yay >/dev/null || die "packages require yay before this stage: ${aur[*]}"
         arch_user_command yay -S "${aur[@]}"
@@ -5601,15 +5732,18 @@ arch_prepare_hardware() {
 }
 
 copy_common_data() {
-    local destination="$TARGET_MOUNT/usr/local/share/install-system/common"
+    # The shared helpers belong to the running installer version, like the copied script,
+    # so a resume with an updated installer updates them too.
+    local destination="$TARGET_MOUNT/usr/local/share/install-system/common" temporary
     [[ -s "$COMMON_DATA/hardware.py" && -s "$COMMON_DATA/displays.py" && -s "$COMMON_DATA/browser-extensions.sh" ]] || die "keep packaging/common beside the installer"
     install -d -m 0755 "$(dirname "$destination")"
-    if [[ -d "$destination" ]]; then
-        common_data_matches "$destination" || die "shared installation inputs differ; resume with matching inputs"
-    else
-        cp -a --no-preserve=ownership "$COMMON_DATA" "$destination"
-        chmod -R u=rwX,go=rX "$destination"
-    fi
+    [[ ! -L "$destination" ]] || die "shared installation inputs must not be a symlink: $destination"
+    common_data_matches "$destination" && return 0
+    temporary="$(mktemp -d "$(dirname "$destination")/.common.XXXXXX")"
+    cp -a --no-preserve=ownership "$COMMON_DATA/." "$temporary"
+    chmod -R u=rwX,go=rX "$temporary"
+    rm -rf --one-file-system -- "$destination"
+    mv -T -- "$temporary" "$destination"
 }
 
 common_data_matches() {
@@ -5636,7 +5770,7 @@ arch_desktop_lists() {
 arch_host_tools() {
     printf '%s\n' pacstrap pacman pacman-key blkid chroot cmp curl diff findmnt flock git \
         lsblk mkfs.vfat mount mountpoint parted partprobe python3 readlink sha256sum \
-        tar udevadm umount wipefs "mkfs.$FILESYSTEM"
+        tar udevadm umount unshare wipefs "mkfs.$FILESYSTEM"
     [[ "$FILESYSTEM" != btrfs ]] || printf '%s\n' btrfs
 }
 
@@ -5664,6 +5798,9 @@ arch_host_preflight() {
 
 arch_mount_root() {
     local subvolume path layout
+    local -a public_dirs=(/etc /var /var/lib /var/cache /var/cache/pacman)
+    [[ "$FILESYSTEM" == btrfs ]] || public_dirs+=(/home)
+    [[ "$(readlink -m "$TARGET_MOUNT")" == "$TARGET_MOUNT" ]] || die "target mountpoint must not contain symlinks"
     if ! mountpoint -q "$TARGET_MOUNT"; then
         target_mount_tree_is_empty || die "target has mounted descendants"
         ensure_target_mount_directory
@@ -5674,7 +5811,7 @@ arch_mount_root() {
             while read -r subvolume path; do
                 if ! btrfs subvolume show "$TARGET_MOUNT/$subvolume" >/dev/null 2>&1; then
                     [[ ! -e "$TARGET_MOUNT/$subvolume" ]] || die "Btrfs subvolume path is occupied: $subvolume"
-                    run btrfs subvolume create "$TARGET_MOUNT/$subvolume"
+                    run_public btrfs subvolume create "$TARGET_MOUNT/$subvolume"
                 fi
             done <<<"$layout"
             run umount "$TARGET_MOUNT"
@@ -5686,31 +5823,64 @@ arch_mount_root() {
         remember_mount "$TARGET_MOUNT"
     fi
     [[ "$(findmnt -rn -o UUID -T "$TARGET_MOUNT")" == "${STATE[root_uuid]}" ]] || die "wrong root mounted at $TARGET_MOUNT"
+    [[ "$MODE" != new || "$(stat -c %u "$TARGET_MOUNT")" == 0 ]] || die "target root must be owned by root"
     if [[ "$FILESYSTEM" == btrfs ]]; then
         [[ "$(findmnt -rn -o FSROOT -T "$TARGET_MOUNT")" == /@ ]] || die "target root must be the @ subvolume"
         layout="$(arch_read_list btrfs-subvolumes)"
         while read -r subvolume path; do
             [[ "$path" != / ]] || continue
-            install -d -m 0755 "$TARGET_MOUNT$path"
+            [[ "$(readlink -m "$TARGET_MOUNT$path")" == "$TARGET_MOUNT$path" ]] || die "target subvolume path must not contain symlinks: $path"
             if ! mountpoint -q "$TARGET_MOUNT$path"; then
+                install -d -m 0755 "$TARGET_MOUNT$path"
                 run mount -o "noatime,compress=zstd,subvol=$subvolume" "$ROOT_PARTITION" "$TARGET_MOUNT$path"
                 remember_mount "$TARGET_MOUNT$path"
             fi
             [[ "$(findmnt -rn -o FSROOT -T "$TARGET_MOUNT$path")" == "/$subvolume" &&
-               "$(findmnt -rn -o UUID -T "$TARGET_MOUNT$path")" == "${STATE[root_uuid]}" ]] || die "wrong subvolume mounted at $path"
+                "$(findmnt -rn -o UUID -T "$TARGET_MOUNT$path")" == "${STATE[root_uuid]}" ]] || die "wrong subvolume mounted at $path"
+            if [[ "$MODE" == new ]]; then
+                [[ "$(stat -c %u "$TARGET_MOUNT$path")" == 0 ]] || die "target subvolume must be owned by root: $path"
+                [[ "$path" == /.snapshots ]] || chmod 0755 "$TARGET_MOUNT$path"
+            fi
         done <<<"$layout"
+    fi
+    if [[ "$MODE" == new ]]; then
+        # Public OS directories need traversal by the target user, including on resume.
+        chmod 0755 "$TARGET_MOUNT"
+        for path in "${public_dirs[@]}"; do
+            [[ "$(readlink -m "$TARGET_MOUNT$path")" == "$TARGET_MOUNT$path" ]] || die "target $path must not contain symlinks"
+            ! mountpoint -q "$TARGET_MOUNT$path" || die "target $path must be a directory in the root filesystem"
+            [[ ! -e "$TARGET_MOUNT$path" || ( -d "$TARGET_MOUNT$path" && "$(stat -c %u "$TARGET_MOUNT$path")" == 0 ) ]] ||
+                die "target $path must be a root-owned directory"
+            install -d -m 0755 "$TARGET_MOUNT$path"
+        done
     fi
 }
 
 arch_validate_mounts() {
     local subvolume path layout
+    local -a public_dirs=(/etc /var /var/lib /var/cache /var/cache/pacman)
+    [[ "$FILESYSTEM" == btrfs ]] || public_dirs+=(/home)
+    [[ "$(readlink -m "$TARGET_MOUNT")" == "$TARGET_MOUNT" ]] || return 1
     validate_mounts_stage || return 1
     [[ "$(findmnt -rn -o UUID -T "$TARGET_MOUNT")" == "${STATE[root_uuid]}" ]] || return 1
+    if [[ "$MODE" == new ]]; then
+        [[ "$(stat -c %u "$TARGET_MOUNT")" == 0 && "$(stat -c '%a' "$TARGET_MOUNT")" == 755 ]] || return 1
+        for path in "${public_dirs[@]}"; do
+            [[ -d "$TARGET_MOUNT$path" && "$(readlink -m "$TARGET_MOUNT$path")" == "$TARGET_MOUNT$path" &&
+               "$(stat -c %u "$TARGET_MOUNT$path")" == 0 && "$(stat -c '%a' "$TARGET_MOUNT$path")" == 755 ]] || return 1
+            ! mountpoint -q "$TARGET_MOUNT$path" || return 1
+        done
+    fi
     if [[ "$FILESYSTEM" == btrfs ]]; then
         layout="$(arch_read_list btrfs-subvolumes)" || return 1
         while read -r subvolume path; do
-            [[ "$(findmnt -rn -o FSROOT -T "$TARGET_MOUNT${path%/}")" == "/$subvolume" &&
-               "$(findmnt -rn -o UUID -T "$TARGET_MOUNT${path%/}")" == "${STATE[root_uuid]}" ]] || return 1
+            [[ "$(readlink -m "$TARGET_MOUNT${path%/}")" == "$TARGET_MOUNT${path%/}" &&
+               "$(findmnt -rn -o FSROOT -M "$TARGET_MOUNT${path%/}")" == "/$subvolume" &&
+                "$(findmnt -rn -o UUID -M "$TARGET_MOUNT${path%/}")" == "${STATE[root_uuid]}" ]] || return 1
+            if [[ "$MODE" == new ]]; then
+                [[ "$(stat -c %u "$TARGET_MOUNT${path%/}")" == 0 ]] || return 1
+                [[ "$path" == /.snapshots || "$(stat -c '%a' "$TARGET_MOUNT${path%/}")" == 755 ]] || return 1
+            fi
         done <<<"$layout"
     fi
 }
@@ -5733,7 +5903,7 @@ arch_bootstrap() {
     config="$(dirname "$STATE_FILE")/bootstrap-pacman.conf"
     arch_pacman_config vanilla | write_file "$config" 0644
     # Never inherit a live system's repositories or mirror/key configuration.
-    run pacstrap -K -M -C "$config" "$TARGET_MOUNT" "${selected[@]}"
+    run_public pacstrap -K -M -C "$config" "$TARGET_MOUNT" "${selected[@]}"
 }
 
 arch_validate_bootstrap() {
@@ -5770,7 +5940,7 @@ arch_target_setup() {
     # The chroot has a private /run. Use the live resolver's contents, never an
     # absolute symlink into a resolved runtime directory that is absent there.
     [[ ! -L "$TARGET_MOUNT/etc/resolv.conf" ]] || rm -- "$TARGET_MOUNT/etc/resolv.conf"
-    cp -L /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
+    run install -m 0644 /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
     if [[ ! -f "$TARGET_MOUNT/var/lib/install-system/arch-managed/etc/pacman.conf.sha256" ]]; then
         arch_pacman_config vanilla | write_file "$TARGET_MOUNT/etc/pacman.conf" 0644
     fi
@@ -5783,7 +5953,8 @@ arch_validate_target_setup() {
         validate_arch_source "$TARGET_MOUNT$ARCH_DATA" &&
         cmp -s "$TARGET_MOUNT/etc/fstab" <(arch_fstab_contents) &&
         findmnt -rn -S "$BOOT_PARTITION" -M "$TARGET_MOUNT/efi" >/dev/null &&
-        [[ ! -L "$TARGET_MOUNT/etc/resolv.conf" ]] && cmp -s /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
+        [[ ! -L "$TARGET_MOUNT/etc/resolv.conf" && "$(stat -c '%a' "$TARGET_MOUNT/etc/resolv.conf")" == 644 ]] &&
+        cmp -s /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
 }
 
 arch_target_preflight() {
@@ -5833,7 +6004,7 @@ arch_services() {
     local action="$1" layer="$2" services service
     services="$(arch_read_list "system/$layer/services")" || return 1
     while IFS= read -r service; do
-        if [[ "$action" == apply ]]; then run systemctl --root=/ enable "$service";
+        if [[ "$action" == apply ]]; then run_public systemctl --root=/ enable "$service";
         else systemctl --root=/ is-enabled --quiet "$service" || return 1; fi
     done <<<"$services"
 }
@@ -5844,8 +6015,8 @@ arch_repositories() {
     if [[ "$REPOSITORIES" == cachyos ]]; then
         key="$(arch_read_list pacman/cachyos-key)"
         [[ "$key" =~ ^[0-9A-F]{40}$ ]] || die "invalid CachyOS key fingerprint"
-        run pacman-key --recv-keys "$key" --keyserver hkps://keyserver.ubuntu.com
-        run pacman-key --lsign-key "$key"
+        run_public pacman-key --recv-keys "$key" --keyserver hkps://keyserver.ubuntu.com
+        run_public pacman-key --lsign-key "$key"
     fi
     if [[ "$REPOSITORIES" == cachyos ]]; then
         # Bootstrap signing keys and the architecture-aware package manager from
@@ -5853,11 +6024,11 @@ arch_repositories() {
         arch_pacman_config cachyos baseline | arch_managed_file /etc/pacman.conf
         packages="$(arch_package_names repositories/cachyos)"
         mapfile -t selected <<<"$packages"
-        run pacman -Sy --noconfirm "${selected[@]/#/cachyos/}"
-        run pacman-key --populate cachyos
+        run_public pacman -Sy --noconfirm "${selected[@]/#/cachyos/}"
+        run_public pacman-key --populate cachyos
     fi
     arch_pacman_config | arch_managed_file /etc/pacman.conf
-    run pacman -Syu --noconfirm
+    run_public pacman -Syu --noconfirm
 }
 
 arch_validate_repositories() {
@@ -5889,7 +6060,7 @@ arch_system_config() {
     printf 'en_US.UTF-8 UTF-8\n' | arch_managed_file /etc/locale.gen
     printf 'LANG=en_US.UTF-8\n' | arch_managed_file /etc/locale.conf
     run locale-gen
-    run hwclock --systohc --utc
+    run_public hwclock --systohc --utc
     run systemd-machine-id-setup
     arch_system_layer apply minimal
     arch_services apply minimal
@@ -5935,7 +6106,7 @@ arch_yay() {
     fi
     helper="$(arch_package_names aur-helper)"
     if pacman -Si "$helper" >/dev/null 2>&1; then
-        run pacman -S --noconfirm "$helper"
+        run_public pacman -S --noconfirm "$helper"
     else
         run_as_user install -d -m 0755 "/home/$USERNAME/.cache/install-system"
         build="$(run_as_user mktemp -d "/home/$USERNAME/.cache/install-system/yay.XXXXXX")"
@@ -5949,6 +6120,7 @@ arch_validate_yay() {
 }
 
 arch_snapshots() {
+    local number
     [[ "$FILESYSTEM" == btrfs ]] || return 0
     arch_install_lists filesystem/btrfs-aur
     # The flat @snapshots subvolume already exists; native configuration avoids
@@ -5965,6 +6137,17 @@ EOF
     chmod 0750 /.snapshots
     arch_services apply btrfs
     run snapper --no-dbus -c root list
+    # The first snapshot is the finished installation, offered in the GRUB menu. Without
+    # a cleanup algorithm it stays until it is deleted by hand.
+    if [[ ! -v STATE[first_snapshot] ]]; then
+        number="$(snapper --no-dbus -c root create --description 'install-system: installed system' --print-number)"
+        [[ "$number" =~ ^[0-9]+$ ]] || die "snapper did not report the number of the first snapshot"
+        state_set first_snapshot "$number"
+    fi
+    run_public grub-mkconfig -o /boot/grub/grub.cfg
+    [[ ! -d "/.snapshots/${STATE[first_snapshot]}/snapshot" ]] ||
+        grep -qsF "@snapshots/${STATE[first_snapshot]}/snapshot" /boot/grub/grub-btrfs.cfg ||
+        die "the GRUB menu does not list the first snapshot; check /etc/default/grub-btrfs/config"
 }
 
 arch_validate_snapshots() {
@@ -5974,7 +6157,8 @@ arch_validate_snapshots() {
            "$(findmnt -rn -o UUID -M /.snapshots)" == "${STATE[root_uuid]}" ]] &&
         grep -qxF 'SNAPPER_CONFIGS="root"' /etc/conf.d/snapper &&
         grep -qxF "dev = /dev/disk/by-uuid/${STATE[root_uuid]}" /etc/snapper-rollback.conf &&
-        arch_services check btrfs && snapper --no-dbus -c root list >/dev/null
+        arch_services check btrfs && snapper --no-dbus -c root list >/dev/null &&
+        [[ "${STATE[first_snapshot]:-}" =~ ^[0-9]+$ ]]
 }
 
 arch_kernel() {
@@ -6021,13 +6205,11 @@ arch_boot() {
     fi
     run mkinitcpio -P
     if [[ "$BOOT_METHOD" == grub ]]; then
-        run grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=Arch --no-nvram
-        run grub-install --target=x86_64-efi --efi-directory=/efi --removable --no-nvram
+        run_public grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=Arch --no-nvram
+        run_public grub-install --target=x86_64-efi --efi-directory=/efi --removable --no-nvram
         arch_system_layer apply grub
-        if [[ "$FILESYSTEM" == btrfs ]]; then
-            run snapper --no-dbus -c root create --description 'install-system: bootable system' --cleanup-algorithm number
-        fi
-        run grub-mkconfig -o /boot/grub/grub.cfg
+        # On Btrfs the snapshots stage takes the first snapshot once installation is done.
+        run_public grub-mkconfig -o /boot/grub/grub.cfg
     fi
     if [[ "$CREATE_EFI_ENTRY" == yes ]] && ! arch_efi_entry_exists; then
         parent="$(lsblk -nro PKNAME "$BOOT_PARTITION")"
@@ -6051,9 +6233,9 @@ arch_validate_boot() {
             [[ -s "/boot/initramfs-$kernel.img" ]] &&
             grep -qF "vmlinuz-$kernel" /boot/grub/grub.cfg &&
             arch_system_layer check grub || return 1
+        # grub-btrfs adds its snapshot submenu even before the first snapshot exists.
         if [[ "$FILESYSTEM" == btrfs ]]; then
             grep -q 'grub-btrfs' /boot/grub/grub.cfg || return 1
-            [[ -s /boot/grub/grub-btrfs.cfg ]] || return 1
         fi
     else
         cmp -s /etc/kernel/cmdline <(printf 'root=UUID=%s rw rootfstype=f2fs\n' "${STATE[root_uuid]}") || return 1
@@ -6196,9 +6378,18 @@ arch_run_target() {
     if [[ "$MODE" == existing || "$(state_stage_status accounts)" == done ]]; then select_existing_user; fi
     set_tier_features
     collect_answers
-    local -a sequence=()
+    local entry
+    local -a sequence=() ordered=()
     if [[ "$MODE" == new ]]; then sequence+=("${MINIMAL_SEQUENCE[@]}"); else sequence+=("${EXISTING_SEQUENCE[@]}"); fi
     sequence+=("${DWL_SEQUENCE[@]}" "${FULL_SEQUENCE[@]}")
+    if [[ "$MODE" == new ]]; then
+        for entry in "${sequence[@]}"; do
+            [[ "${entry%%:*}" != "$TIER-complete" ]] || ordered+=("${FINAL_SEQUENCE[@]}")
+            ordered+=("$entry")
+        done
+        ((${#ordered[@]} == ${#sequence[@]} + ${#FINAL_SEQUENCE[@]})) || die "internal error: no completion stage for tier $TIER"
+        sequence=("${ordered[@]}")
+    fi
     run_sequence "${sequence[@]}"
     ((STOP_REQUESTED)) || log "Arch full installation is complete ($DESKTOP)."
 }
