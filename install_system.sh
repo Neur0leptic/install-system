@@ -4139,16 +4139,20 @@ validate_librewolf_setup_outputs() {
 }
 
 librewolf_profile() { # check|create
-    # As the target user. "check" succeeds when ~/.librewolf/profiles.ini names an existing
-    # default profile, read the way the unchanged setup script reads it. "create" starts
-    # LibreWolf headless until that is true, at most 30 seconds, and stops it again.
+    # As the target user. "check" succeeds when the profile that the unchanged setup script
+    # reads from ~/.librewolf/profiles.ini is the one the browser-theme helper accepts as
+    # LibreWolf's only default profile, safe to use; the stage checks the result with that
+    # helper, so the script must not change any other profile. "create" starts LibreWolf
+    # headless until that is true, at most 30 seconds, and stops it again.
     # LibreWolf now puts new profiles under ~/.config/librewolf/librewolf unless
     # ~/.librewolf already has one; MOZ_LEGACY_HOME=1 keeps them in ~/.librewolf.
     run_as_user env MOZ_LEGACY_HOME=1 /bin/bash -c '
         ready() {
-            local profile
+            local profile chosen
             profile="$(sed -n "/^\[Install/,/^\[/{/^Default=/{s/^Default=//p;q}}" "$HOME/.librewolf/profiles.ini" 2>/dev/null)" &&
-                [[ -n "$profile" && -d "$HOME/.librewolf/$profile" ]]
+                [[ -n "$profile" ]] &&
+                chosen="$("$HOME/.local/bin/setup_browser_theme.sh" --librewolf-profile 2>/dev/null)" &&
+                [[ "$(readlink -m -- "$HOME/.librewolf/$profile")" == "$chosen" ]]
         }
         [[ "$1" == create ]] || { ready; exit; }
         librewolf --headless --no-remote &
@@ -4169,9 +4173,11 @@ librewolf_profile() { # check|create
 }
 
 phase_librewolf_setup() {
-    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" home="/home/$USERNAME" result answer output
+    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" home="/home/$USERNAME" result answer output root
+    local -a xdg_profiles=()
     ! missing_for_stage www-client/librewolf || return 0
     [[ -x "$script" ]] || die "managed LibreWolf setup script is missing"
+    [[ -x "$home/.local/bin/setup_browser_theme.sh" ]] || die "managed browser-theme helper is missing"
     if [[ "${STATE[librewolf_setup_result]:-}" == failed && "${FORCE_STAGE:-}" != librewolf-setup ]]; then
         if validate_librewolf_setup_outputs && ((NON_INTERACTIVE == 0)); then
             read -r -p 'Did the LibreWolf/Arkenfox setup succeed when you completed it manually? [y/N] ' answer
@@ -4186,11 +4192,20 @@ phase_librewolf_setup() {
     fi
     # The unchanged script needs a profile in ~/.librewolf; a first start creates it there.
     if ! librewolf_profile check; then
-        if [[ "$MODE" == existing && ! -e "$home/.librewolf/profiles.ini" &&
-              -e "$home/.config/librewolf/librewolf/profiles.ini" ]]; then
-            # LibreWolf would switch this account to a new, empty profile in ~/.librewolf.
+        if [[ -e "$home/.librewolf/profiles.ini" || -L "$home/.librewolf/profiles.ini" ]]; then
+            # LibreWolf already keeps its profiles there, so another start would not help.
+            run_as_user "$home/.local/bin/setup_browser_theme.sh" --librewolf-profile >/dev/null || true
+            request_wait "$USERNAME's ~/.librewolf/profiles.ini does not name one safe default profile that the unchanged setup script can use; repair it, then continue"
+            return 0
+        fi
+        for root in "$home/.config/librewolf/librewolf" "$home/.config/librewolf"; do
+            [[ ! -e "$root/profiles.ini" ]] || xdg_profiles+=("${root#"$home/"}")
+        done
+        if ((${#xdg_profiles[@]} && INTERNAL_CHROOT == 0)); then
+            # On a running system that profile may hold the account's data, and LibreWolf
+            # would switch to a new, empty profile in ~/.librewolf.
             state_set librewolf_setup_result failed
-            request_wait "LibreWolf keeps $USERNAME's existing profile in ~/.config/librewolf/librewolf, which the unchanged setup script does not use; apply Arkenfox to that profile yourself, then continue and confirm it"
+            request_wait "LibreWolf keeps $USERNAME's existing profile in ~/${xdg_profiles[0]}, which the unchanged setup script does not use; apply Arkenfox to that profile yourself, then continue and confirm it"
             return 0
         fi
         run_as_user /bin/bash -c 'command -v librewolf' >/dev/null || die "LibreWolf is not installed"
@@ -4204,6 +4219,10 @@ phase_librewolf_setup() {
             return 0
         fi
         rm -f -- "$output"
+        # In the installer's chroot the system is not running, so such a profile comes
+        # from an earlier setup attempt. It stays on disk as it is.
+        ((${#xdg_profiles[@]} == 0)) ||
+            log "LibreWolf now uses ~/.librewolf; the profile an earlier attempt left in ~/${xdg_profiles[0]} stays unused."
     fi
     # Interruptions and explicit retries must not retain a previous success result.
     state_set librewolf_setup_result failed
@@ -6145,9 +6164,14 @@ EOF
         state_set first_snapshot "$number"
     fi
     run_public grub-mkconfig -o /boot/grub/grub.cfg
-    [[ ! -d "/.snapshots/${STATE[first_snapshot]}/snapshot" ]] ||
-        grep -qsF "@snapshots/${STATE[first_snapshot]}/snapshot" /boot/grub/grub-btrfs.cfg ||
-        die "the GRUB menu does not list the first snapshot; check /etc/default/grub-btrfs/config"
+    arch_first_snapshot_listed || die "the GRUB menu does not list the first snapshot; check /etc/default/grub-btrfs/config"
+}
+
+arch_first_snapshot_listed() {
+    # The GRUB menu offers the first snapshot; one deleted later by hand is no longer expected.
+    [[ "${STATE[first_snapshot]:-}" =~ ^[0-9]+$ ]] &&
+        { [[ ! -d "/.snapshots/${STATE[first_snapshot]}/snapshot" ]] ||
+            grep -qsF "@snapshots/${STATE[first_snapshot]}/snapshot" /boot/grub/grub-btrfs.cfg; }
 }
 
 arch_validate_snapshots() {
@@ -6158,7 +6182,7 @@ arch_validate_snapshots() {
         grep -qxF 'SNAPPER_CONFIGS="root"' /etc/conf.d/snapper &&
         grep -qxF "dev = /dev/disk/by-uuid/${STATE[root_uuid]}" /etc/snapper-rollback.conf &&
         arch_services check btrfs && snapper --no-dbus -c root list >/dev/null &&
-        [[ "${STATE[first_snapshot]:-}" =~ ^[0-9]+$ ]]
+        arch_first_snapshot_listed
 }
 
 arch_kernel() {
