@@ -2375,64 +2375,109 @@ emerge_with_resources() { # [--keep-going] EMERGE-ARGUMENTS
 }
 
 phase_hardware_policy() {
+    local cpv
     ensure_hardware_plan
     deploy_policy_layer hardware/auto/resources
     deploy_policy_layer hardware/auto/minimal
-    retire_versioned_firmware_lists
     install_policy_sets hardware/auto/minimal
+    cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+    [[ -n "$cpv" ]] && firmware_list_managed || return 0
     # A changed list takes effect when the installed linux-firmware version is rebuilt.
     if firmware_list_outdated; then
-        emerge_with_resources --oneshot "=$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+        rebuild_firmware_from_list "$cpv"
+    else
+        settle_firmware_copy "$cpv"
     fi
 }
 
 validate_hardware_policy() {
     hardware_plan_valid && validate_policy_layer hardware/auto/resources &&
         validate_policy_sets hardware/auto/minimal &&
-        hardware_field firmware_list >/dev/null 2>&1 && ! firmware_list_outdated
+        hardware_field firmware_list >/dev/null 2>&1 && ! firmware_list_outdated && ! firmware_copy_pending
 }
 
-retire_versioned_firmware_lists() {
-    # Portage prefers a list named after the exact version over the plain-named one the
-    # installer deploys, so differing version-specific lists are kept aside as backups.
-    local list=/etc/portage/savedconfig/sys-kernel/linux-firmware path
-    [[ -f "$list" ]] || return 0
-    for path in /etc/portage/savedconfig/sys-kernel/linux-firmware-*; do
-        [[ -f "$path" && "$path" != *.pre-install-system ]] && ! cmp -s "$path" "$list" || continue
-        [[ ! -e "$path.pre-install-system" ]] || die "cannot keep $path aside: $path.pre-install-system already exists"
-        mv -- "$path" "$path.pre-install-system"
-        log "Kept the version-specific firmware list aside: $path.pre-install-system"
-    done
+firmware_list_managed() {
+    # True when a firmware list was chosen: linux-firmware is then built from that list.
+    hardware_field firmware_list 2>/dev/null | grep -q '^\['
 }
 
-firmware_list_outdated() {
-    # True when the installed linux-firmware was not built from the chosen list: each build
-    # saves the list it used under the package's version name. Listed files that were
-    # deleted since then count as well.
-    local cpv path missing=0 list=/etc/portage/savedconfig/sys-kernel/linux-firmware
-    hardware_field firmware_list 2>/dev/null | grep -q '^\[' || return 1
-    cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
-    [[ -n "$cpv" ]] || return 1
-    cmp -s "$list" "/etc/portage/savedconfig/$cpv" || return 0
-    [[ -z "$(installed_firmware_outside_list)" ]] || return 0
-    while IFS= read -r path; do
-        [[ -e "$path" ]] || missing=1
-    done < <(awk '$1 == "obj" && index($2, "/lib/firmware/") == 1 {print $2}' "/var/db/pkg/$cpv/CONTENTS")
-    ((missing))
+chosen_firmware_list() {
+    # The plain-named list that Portage restores for every linux-firmware version.
+    grep -v '^[[:space:]]*\(#\|$\)' /etc/portage/savedconfig/sys-kernel/linux-firmware 2>/dev/null || true
+}
+
+installed_firmware() { # CPV: the installed /lib/firmware entries, named as the list names them
+    awk '($1 == "obj" || $1 == "sym") && index($2, "/lib/firmware/") == 1 {
+        name = substr($2, 15); sub(/\.(xz|zst)$/, "", name); print name }' "/var/db/pkg/$1/CONTENTS"
 }
 
 installed_firmware_outside_list() {
     # Prints installed linux-firmware files that the chosen firmware list leaves out.
-    local contents
-    hardware_field firmware_list 2>/dev/null | grep -q '^\[' || return 0
-    contents="$(find /var/db/pkg/sys-kernel -maxdepth 2 -path '*/linux-firmware-*/CONTENTS' -print -quit 2>/dev/null)"
-    [[ -n "$contents" ]] || return 0
-    python3 -c 'import json, sys; print(*json.load(open(sys.argv[1]))["firmware_list"], sep="\n")' "$(hardware_root)/inventory.json" |
-        awk 'NR == FNR { keep[$0] = 1; next }
-             ($1 == "obj" || $1 == "sym") && index($2, "/lib/firmware/") == 1 {
-                 name = substr($2, 15); sub(/\.(xz|zst)$/, "", name)
-                 if (!(name in keep)) print name
-             }' - "$contents"
+    local cpv
+    firmware_list_managed || return 0
+    cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+    [[ -n "$cpv" ]] || return 0
+    grep -vxF -f <(chosen_firmware_list) <(installed_firmware "$cpv") || true
+}
+
+firmware_list_outdated() {
+    # True when the installed linux-firmware does not match the chosen list: a file outside
+    # the list is installed, a listed file was deleted, or the list changed since the build.
+    local cpv path deleted=0 absent
+    firmware_list_managed || return 1
+    cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
+    [[ -n "$cpv" ]] || return 1
+    [[ -z "$(installed_firmware_outside_list)" ]] || return 0
+    while IFS= read -r path; do
+        [[ -e "$path" ]] || deleted=1
+    done < <(awk '$1 == "obj" && index($2, "/lib/firmware/") == 1 {print $2}' "/var/db/pkg/$cpv/CONTENTS")
+    ((deleted == 0)) || return 0
+    # A listed file that is not installed either does not exist in this version or joined
+    # the list after the last build; the checksum of the list that was built tells which.
+    absent="$(grep -vxF -f <(installed_firmware "$cpv") <(chosen_firmware_list) || true)"
+    [[ -n "$absent" ]] || return 1
+    [[ "$(sha256sum </etc/portage/savedconfig/sys-kernel/linux-firmware)" != \
+        "$(cat /var/lib/install-system/firmware-list.sha256 2>/dev/null)" ]]
+}
+
+rebuild_firmware_from_list() { # CPV
+    # Portage restores a list named after the exact version, with and then without its
+    # revision, before the plain-named one, and every build saves such a copy; the installed
+    # version's copies therefore step aside first.
+    local version="${1#*/}" name copy
+    portageq best_visible / "=$1" >/dev/null ||
+        die "$1 is no longer available in the Portage tree, so the firmware list cannot be applied to it; update it with 'emerge --oneshot sys-kernel/linux-firmware' and continue"
+    for name in "$version" "${version%-r[0-9]*}"; do
+        copy="/etc/portage/savedconfig/${1%/*}/$name"
+        [[ -f "$copy" ]] || continue
+        [[ -e "$copy.pre-install-system" ]] || cp -p -- "$copy" "$copy.pre-install-system"
+        rm -f -- "$copy"
+    done
+    emerge_with_resources --oneshot "=$1"
+    settle_firmware_copy "$1"
+    sha256sum </etc/portage/savedconfig/sys-kernel/linux-firmware | write_file /var/lib/install-system/firmware-list.sha256 0644
+}
+
+settle_firmware_copy() { # CPV
+    # Each build saves its list under the version's name. When an earlier copy differs or was
+    # removed, Portage leaves the new copy as a config update; it records what is installed
+    # now, so the newest one takes the earlier copy's place.
+    local copy="/etc/portage/savedconfig/$1"
+    local -a updates=()
+    updates=("${copy%/*}"/._cfg[0-9][0-9][0-9][0-9]_"${copy##*/}")
+    ((${#updates[@]})) || return 0
+    if [[ -f "$copy" && ! -e "$copy.pre-install-system" ]]; then
+        cp -p -- "$copy" "$copy.pre-install-system"
+    fi
+    mv -- "${updates[-1]}" "$copy"
+    rm -f -- "${updates[@]:0:${#updates[@]}-1}"
+}
+
+firmware_copy_pending() {
+    local cpv
+    firmware_list_managed || return 1
+    cpv="$(portageq match / sys-kernel/linux-firmware 2>/dev/null | tail -n 1)"
+    [[ -n "$cpv" ]] && compgen -G "/etc/portage/savedconfig/${cpv%/*}/._cfg[0-9][0-9][0-9][0-9]_${cpv##*/}" >/dev/null
 }
 
 phase_display_config() {
