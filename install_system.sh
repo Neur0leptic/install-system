@@ -2068,6 +2068,15 @@ phase_chroot_install() {
     local completion key status=0
     chroot_argument_array
     prepare_credentials "$TARGET_MOUNT"
+    if [[ "$DISTRIBUTION" == arch ]]; then
+        # The target's resolv.conf can become resolved's stub link during installation (older
+        # neuroarch policy linked it whenever pacman's systemd hook applied tmpfiles rules),
+        # and the chroot's private /run has no resolved. Like arch-chroot, give that path the
+        # live resolver, so DNS keeps working either way.
+        mountpoint -q "$TARGET_MOUNT/run" || die "the chroot's /run is not mounted"
+        install -d -m 0755 "$TARGET_MOUNT/run/systemd/resolve"
+        install -m 0644 /etc/resolv.conf "$TARGET_MOUNT/run/systemd/resolve/stub-resolv.conf"
+    fi
     # The target runs in its own PID namespace, so daemons it starts (gpg-agent, dirmngr,
     # a browser) end with the installer instead of keeping the target busy. A shell outside
     # the target is the namespace's first process, so tools in the target still see a
@@ -6378,12 +6387,37 @@ arch_full_packages() {
     arch_uv_tools install
     arch_system_layer apply full
     arch_services apply full
+    if arch_grub_theme_selected; then
+        arch_install_lists boot/grub-theme
+        arch_system_layer apply grub-theme
+        run_public grub-mkconfig -o /boot/grub/grub.cfg
+        arch_grub_theme_listed || die "the GRUB menu does not use its theme; check /etc/default/grub and /etc/default/grub.d"
+    fi
 }
 
 arch_validate_full() {
     arch_check_lists full full-local && arch_local_outputs full-local && arch_uv_tools check &&
         arch_system_layer check full && arch_services check full &&
-        { [[ "$TORRENT" != yes ]] || arch_check_lists torrent; }
+        { [[ "$TORRENT" != yes ]] || arch_check_lists torrent; } &&
+        { ! arch_grub_theme_selected ||
+            { arch_check_lists boot/grub-theme && arch_system_layer check grub-theme && arch_grub_theme_listed; }; }
+}
+
+arch_grub_theme_selected() {
+    # The full tier themes the GRUB menu of new installations; existing systems keep their
+    # boot configuration, and older neuroarch snapshots of resumed installations have no theme.
+    [[ "$MODE" == new && "$BOOT_METHOD" == grub && -s "$ARCH_DATA/packages/boot/grub-theme.list" &&
+       -d "$ARCH_DATA/system/grub-theme" ]]
+}
+
+arch_grub_theme_listed() {
+    # The menu loads the theme that the managed drop-in names (grub-mkconfig reads drop-ins
+    # after /etc/default/grub), under the root's subvolume when there is one.
+    local theme
+    theme="$(sed -n 's/^GRUB_THEME="\(.*\)"$/\1/p' "$ARCH_DATA"/system/grub-theme/etc/default/grub.d/*.cfg | tail -n 1)"
+    [[ "$theme" == /* && -f "$theme" ]] &&
+        awk -v theme="$theme" 'index($0, "set theme=($root)") == 1 &&
+            substr($0, length($0) - length(theme) + 1) == theme { found = 1 } END { exit !found }' /boot/grub/grub.cfg
 }
 
 arch_validate_desktop_complete() {

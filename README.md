@@ -16,7 +16,8 @@ are managed through Chezmoi.
 New Gentoo installations use amd64 no-multilib, OpenRC, F2FS and direct EFI boot.
 Arch supports vanilla or CachyOS packages, with Btrfs/GRUB/Snapper or F2FS. On Btrfs,
 Snapper starts when the installation is finished: its first snapshot is the finished
-system, kept until you delete it and offered in the GRUB menu.
+system, kept until you delete it and offered in the GRUB menu. The menu stays hidden;
+press Esc while the computer starts to show it.
 
 The minimal tier provides the base system. Desktop tiers add the selected
 desktop and its applications; full adds the broader application set.
