@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 
@@ -141,6 +142,16 @@ def suggested_firmware(files, sysfs=Path('/sys'), modules_dir=Path('/lib/modules
     return sorted(chosen)
 
 
+def amd_microcode(proc=Path('/proc')):
+    # The kernel loads AMD microcode by CPU family, and no driver declares these files.
+    info = text(proc / 'cpuinfo')
+    family = re.search(r'^cpu family\s*:\s*(\d+)', info, re.M)
+    if not re.search(r'^vendor_id\s*:\s*AuthenticAMD', info, re.M) or not family:
+        return None
+    family = int(family[1])
+    return f'amd-ucode/microcode_amd_fam{family:02x}h.bin' if family >= 0x15 else 'amd-ucode/microcode_amd.bin'
+
+
 def choose_firmware(plan, root, read, interactive, base=Path('/lib/firmware'), **detection):
     # The chosen list gets the plain name, so it applies to every linux-firmware version.
     lists = saved_firmware_lists(root) if root is not None else {}
@@ -149,6 +160,9 @@ def choose_firmware(plan, root, read, interactive, base=Path('/lib/firmware'), *
         size = firmware_size(entries, files) / 1048576
         return f'{size:.1f} MB' if size < 10 else f'{size:.0f} MB'
     suggested = suggested_firmware(files, **detection) if files else []
+    microcode = amd_microcode()
+    if suggested and microcode in files and microcode not in suggested:
+        suggested = sorted(suggested + [microcode])
     chosen = None
     # A plain-named list is the user's own file; the installer writes only lists it chose.
     plan['firmware_owner'] = 'user' if 'linux-firmware' in lists else 'installer'
@@ -202,8 +216,11 @@ def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
     if not memory_match or int(memory_match[1]) <= 0:
         raise ValueError('available RAM could not be read from /proc/meminfo')
     memory = int(memory_match[1]) // 1024
-    # One emerge at a time; reserve 1 GiB and budget 2 GiB per build worker.
-    jobs = max(1, min(cpus, (memory - 1024) // 2048))
+    # Reserve 1 GiB and budget 2 GiB per build worker. Packages build in parallel only
+    # when memory does not limit the workers; the load average then bounds the total.
+    budget = (memory - 1024) // 2048
+    jobs = max(1, min(cpus, budget))
+    emerge_jobs = 1 if budget < cpus else min(4, max(1, cpus // 4))
     vendor_match = re.search(r'^vendor_id\s*:\s*(\S+)', text(proc / 'cpuinfo'), re.M)
     vendor = vendor_match[1] if vendor_match else ''
     if vendor not in ('GenuineIntel', 'AuthenticAMD'):
@@ -232,12 +249,25 @@ def probe(proc=Path('/proc'), sysfs=Path('/sys'), root=None):
                                     if not p.name.endswith('.pre-install-system'))
     sof = any((p / 'driver').resolve().name.startswith('sof-audio')
               for p in (sysfs / 'bus/pci/devices').glob('*'))
-    return {'schema': 1, 'resources': {'jobs': jobs, 'load': cpus, 'emerge_jobs': 1},
+    return {'schema': 1, 'resources': {'jobs': jobs, 'load': cpus, 'emerge_jobs': emerge_jobs},
             'firmware_use': 'savedconfig' if saved else '-savedconfig', 'sof': sof,
             'cpu_vendor': vendor, 'gpus': gpus, 'outputs': outputs,
             'machine': {key: text(sysfs / 'class/dmi/id' / key) for key in ('sys_vendor', 'product_name', 'product_version')},
             'backlights': [p.name for p in sorted((sysfs / 'class/backlight').glob('*'))],
             'pointers': pointers(sysfs)}
+
+
+def amdgpu_lists(device, modinfo='modinfo'):
+    # amdgpu's alias table names every card it supports; None when it cannot be read.
+    try:
+        number = int(device, 16)
+        result = subprocess.run([modinfo, '-F', 'alias', 'amdgpu'], capture_output=True, text=True, check=False)
+    except (ValueError, FileNotFoundError):
+        return None
+    if result.returncode or not result.stdout.strip():
+        return None
+    prefix = f'pci:v00001002d0000{number:04x}sv'
+    return any(alias.lower().startswith(prefix) for alias in result.stdout.split())
 
 
 def choose(plan, requested, read=input):
@@ -255,6 +285,14 @@ def choose(plan, requested, read=input):
                 family = 'intel-legacy'
             elif driver in ('virtio-pci', 'virtio_gpu', 'vmwgfx', 'qxl', 'bochs'):
                 family = 'virtual'
+            elif vendor == '0x1002' and driver == 'radeon' and (gcn := amdgpu_lists(device.get('device', ''))) is not None:
+                # GCN 1 and 2 cards start with the radeon kernel driver, but amdgpu lists them
+                # too and Mesa drives them with radeonsi; older cards are radeon's alone.
+                family = 'amd' if gcn else 'radeon'
+                if gcn:
+                    print(paint('cyan', 'This GCN card uses the radeon kernel driver, so it renders with GLES2; the amdgpu '
+                                'driver (kernel options radeon.si_support=0 amdgpu.si_support=1, or the cik_support '
+                                'pair) would add Vulkan.', sys.stderr), file=sys.stderr)
             else:
                 options = (('intel-legacy', 'intel-modern') if vendor == '0x8086' else
                            ('amd', 'radeon') if vendor == '0x1002' else
@@ -266,6 +304,8 @@ def choose(plan, requested, read=input):
                     family = options[int(family) - 1]
                 if family not in options:
                     raise ValueError('choose an explicit supported graphics policy with --graphics')
+            # The display settings take the render device and driver from the primary GPU.
+            device['family'] = family
             if family not in families:
                 families.append(family)
     if not plan['gpus'] and not families:
@@ -285,7 +325,8 @@ def choose(plan, requested, read=input):
         families.insert(0, families.pop(int(selected) - 1))
     # With multiple GPUs, the first selected policy determines the session renderer.
     profile = ('intel-x220' if families[0] == 'intel-legacy' else
-               'nvidia' if families[0].startswith('nvidia') else 'mesa')
+               'nvidia' if families[0].startswith('nvidia') else
+               'modern-amd-intel' if families[0] in ('intel-modern', 'amd') else 'mesa')
     plan['graphics'] = {'families': families, 'profile': profile}
     for family in families:
         print(paint('green', f'Selected: {DESCRIPTIONS[family]} [{family}]', sys.stderr), file=sys.stderr)
@@ -298,7 +339,7 @@ def render_text(content, plan):
     cards = {'intel' if f.startswith('intel') else 'nvidia' if f.startswith('nvidia') else card_names[f]
              for f in plan['graphics']['families']}
     for key, value in {'BUILD_JOBS': r['jobs'], 'BUILD_LOAD': r['load'],
-                       'EMERGE_JOBS': 1, 'VIDEO_CARDS': ' '.join(sorted(cards)),
+                       'EMERGE_JOBS': r.get('emerge_jobs', 1), 'VIDEO_CARDS': ' '.join(sorted(cards)),
                        'FIRMWARE_USE': plan['firmware_use']}.items():
         content = content.replace('@' + key + '@', str(value))
     if re.search(r'@[A-Z_]+@', content):
@@ -307,7 +348,15 @@ def render_text(content, plan):
 
 
 def render(plan, destination, templates):
-    for stage in ('resources', 'minimal', 'dwl', 'full'):
+    # Each rendering starts empty, so files and stages that the templates no longer
+    # have (such as the former build-job override) are not deployed again.
+    if destination.is_dir():
+        for path in destination.iterdir():
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    for stage in ('minimal', 'dwl', 'full'):
         sources = [templates / 'common' / stage]
         if stage == 'minimal' and plan['cpu_vendor'] == 'GenuineIntel':
             sources.append(templates / 'intel-cpu/minimal')

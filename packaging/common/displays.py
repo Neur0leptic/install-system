@@ -15,6 +15,18 @@ VULKAN_FAMILIES = ('intel-modern', 'amd', 'nvidia-open', 'nvidia-closed')
 SIDES = ('left', 'right', 'above', 'below')
 
 
+def primary_gpu(inventory):
+    # The GPU of the first selected policy renders the session; a policy given on the
+    # command line is matched by vendor.
+    families = inventory.get('graphics', {}).get('families', [])
+    if not families:
+        return None
+    gpus = inventory.get('gpus', [])
+    vendor = {'intel': '0x8086', 'amd': '0x1002', 'radeon': '0x1002', 'nvidia': '0x10de'}.get(families[0].split('-')[0])
+    return (next((gpu for gpu in gpus if gpu.get('family') == families[0]), None) or
+            next((gpu for gpu in gpus if vendor and gpu.get('vendor') == vendor), None))
+
+
 def device_name(name):
     # DWL and Hyprland match input devices by name, lower-cased with hyphens for spaces.
     return ''.join('-' if c == ' ' else c.lower() if 'A' <= c <= 'Z' else c for c in name)
@@ -210,8 +222,10 @@ def prompt(inventory, defaults=None, read=input, report=print, desktop='dwl', ke
     defaults = defaults or {}
     detected = inventory.get('outputs', [])
     families = inventory.get('graphics', {}).get('families', [])
-    renderer = defaults.get('renderer') or ('vulkan' if families[:1] and families[0] in VULKAN_FAMILIES
-                                            else 'gles2' if families else 'auto')
+    primary = primary_gpu(inventory)
+    # A GCN card on the radeon kernel driver has radeonsi but no Vulkan.
+    vulkan = bool(families) and families[0] in VULKAN_FAMILIES and (primary or {}).get('driver') != 'radeon'
+    renderer = defaults.get('renderer') or ('vulkan' if vulkan else 'gles2' if families else 'auto')
     # DWL uses wide color only where a display supports it and otherwise keeps sRGB.
     # Hyprland's template forces it, so new displays start with sRGB there.
     color = 'wide' if renderer == 'vulkan' and desktop == 'dwl' else 'srgb'
@@ -250,7 +264,12 @@ def prompt(inventory, defaults=None, read=input, report=print, desktop='dwl', ke
         if output['enabled'] is False:
             output['tags'] = [tag for tag in output.get('tags', []) if tag not in used]
     settings = {**defaults, 'schema': 1, 'outputs': outputs, 'machine': inventory.get('machine', {}), 'renderer': renderer}
-    settings.setdefault('vaapi', 'i965' if families == ['intel-legacy'] else 'auto')
+    settings.setdefault('vaapi', 'i965' if families[:1] == ['intel-legacy'] else
+                        'nvidia' if families[:1] and families[0].startswith('nvidia') else 'auto')
+    # With several GPUs the session renders on the primary one rather than on whichever
+    # card the compositor would pick.
+    if len(inventory.get('gpus', [])) > 1 and not settings.get('renderDevice') and (primary or {}).get('render_nodes'):
+        settings['renderDevice'] = primary['render_nodes'][0]
     layouts = settings.get('keyboardLayout', 'us')
     settings['keyboardLayout'] = read(f'Keyboard layouts: one or more, comma-separated, e.g. us or us,de,tr; the first is the default [{layouts}]: ') or layouts
     options = settings.get('keyboardOptions', 'grp:alt_shift_toggle')

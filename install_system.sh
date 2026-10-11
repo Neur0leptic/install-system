@@ -336,7 +336,7 @@ path_contains_mountpoint() {
     local path="$1" mounted
     while IFS= read -r mounted; do
         [[ "$mounted" != "$path" && "$mounted" != "$path"/* ]] || return 0
-    done < <(findmnt -rn -o TARGET)
+    done < <(findmnt -rn -o TARGET || true)
     return 1
 }
 
@@ -1340,8 +1340,9 @@ ensure_github_known_host() {
         die "could not install the pinned GitHub SSH host key"
 }
 
-run_as_user() {
-    local home="/home/$USERNAME" account_shell
+run_as_user() { # [--stdin] COMMAND...: --stdin passes the caller's input instead of none
+    local home="/home/$USERNAME" account_shell input=/dev/null
+    if [[ "${1:-}" == --stdin ]]; then input=/dev/stdin; shift; fi
     account_shell="$(getent passwd "$USERNAME" | cut -d: -f7)" || return 1
     [[ "$account_shell" == /* ]] || die "target account has no valid shell"
     local -a clean_env=(
@@ -1355,7 +1356,30 @@ run_as_user() {
     )
     user_home_is_safe || die "unsafe or unexpected home directory for $USERNAME"
     user_ssh_agent_is_safe && clean_env+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
-    run setsid --fork --wait -- runuser -u "$USERNAME" -- env -i "${clean_env[@]}" "$@" </dev/null
+    # The account's usual umask instead of the installer's private one: chezmoi records the
+    # modes it means to give new directories, and a masked mkdir looks like a local edit
+    # on the next apply.
+    run setsid --fork --wait -- runuser -u "$USERNAME" -- env -i "${clean_env[@]}" \
+        /bin/sh -c 'umask 022; exec "$@"' sh "$@" <"$input"
+}
+
+unlock_private_key() { # SOURCE: the private dotfiles key's passphrase, cached in gpg-agent
+    # pinentry needs a terminal, which the installer's user commands do not have. A missing
+    # passphrase is therefore read here and given to gpg once on its standard input.
+    local source="$1" probe passphrase
+    probe="$(head -n 1 "$source/private-source-allowlist.txt" 2>/dev/null)" || return 0
+    [[ "$probe" == */encrypted_*.asc && -f "$source/$probe" && ! -L "$source/$probe" ]] || return 0
+    run_as_user gpg --batch --quiet --pinentry-mode error --decrypt "$source/$probe" >/dev/null 2>&1 && return 0
+    if ((NON_INTERACTIVE)); then
+        request_wait "unlock the private dotfiles' GPG key in the account's gpg-agent, then continue"
+        return 1
+    fi
+    IFS= read -r -s -p 'Passphrase of the GPG key for the private dotfiles: ' passphrase </dev/tty ||
+        die "passphrase input ended"
+    printf '\n' >/dev/tty
+    run_as_user --stdin gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 0 \
+        --decrypt "$source/$probe" >/dev/null < <(printf '%s' "$passphrase") ||
+        die "the passphrase did not unlock the GPG key; run continue to try again"
 }
 
 request_wait() {
@@ -1525,7 +1549,7 @@ device_is_under_disk() {
     local device="$1" disk="$2" ancestor
     while IFS= read -r ancestor; do
         [[ "$ancestor" == "$disk" ]] && return 0
-    done < <(lsblk -snrpo NAME "$device")
+    done < <(lsblk -snrpo NAME "$device" || true)
     return 1
 }
 
@@ -1533,7 +1557,7 @@ disk_has_active_users() {
     local disk="$1" device mounts swap_device _
     while read -r device mounts; do
         [[ -z "${mounts:-}" ]] || return 0
-    done < <(lsblk -nrpo NAME,MOUNTPOINTS "$disk")
+    done < <(lsblk -nrpo NAME,MOUNTPOINTS "$disk" || true)
 
     while read -r swap_device _; do
         [[ "$swap_device" == "Filename" ]] && continue
@@ -1548,7 +1572,7 @@ disk_has_holders() {
     while IFS= read -r device; do
         base="$(basename "$device")"
         compgen -G "/sys/class/block/$base/holders/*" >/dev/null && return 0
-    done < <(lsblk -nrpo NAME "$disk")
+    done < <(lsblk -nrpo NAME "$disk" || true)
     return 1
 }
 
@@ -1628,7 +1652,7 @@ find_partition_by_label() {
             printf '%s' "$device"
             return 0
         }
-    done < <(lsblk -nrpo NAME,PARTLABEL "$disk")
+    done < <(lsblk -nrpo NAME,PARTLABEL "$disk" || true)
     return 1
 }
 
@@ -1799,7 +1823,7 @@ keyring_has_fingerprint() {
         if [[ "$type" == "fpr" && "$fingerprint" == "$wanted" ]]; then
             return 0
         fi
-    done < <(gpg --batch --show-keys --with-colons "$keyring" 2>/dev/null)
+    done < <(gpg --batch --show-keys --with-colons "$keyring" 2>/dev/null || true)
     return 1
 }
 
@@ -2337,16 +2361,30 @@ ensure_hardware_plan() {
         hardware_tool firmware --plan "$root/inventory.json" "${args[@]}" >"$temporary"
         mv -T "$temporary" "$root/inventory.json"
     fi
-    if [[ "$DISTRIBUTION" == gentoo ]]; then
-        hardware_tool render --plan "$root/inventory.json" --destination "$root/policy" --templates "$NEUROGENTOO_ROOT/config/hardware/templates"
-    fi
+    HARDWARE_RENDERED=0
+    render_hardware_policy
     GPU_PROFILE="$(hardware_field graphics.profile)"
     [[ "${STATE[gpu_profile]:-}" == "$GPU_PROFILE" ]] || state_set gpu_profile "$GPU_PROFILE"
     hardware_plan_valid || die "new hardware snapshot did not validate"
     if [[ -n "$DISPLAY_CONFIG" && "$DISPLAY_CONFIG" != "$root/display-input.json" ]]; then
         install -m 0600 -- "$DISPLAY_CONFIG" "$root/display-input.json"
     fi
-    log "Hardware: $(hardware_field graphics.profile); build workers $(hardware_field resources.jobs), load $(hardware_field resources.load), emerge jobs $(hardware_field resources.emerge_jobs)"
+    if [[ "$DISTRIBUTION" != gentoo ]]; then
+        log "Hardware: $(hardware_field graphics.profile)"
+    elif [[ "$MODE" == new ]]; then
+        log "Hardware: $(hardware_field graphics.profile); make.conf gets build workers $(hardware_field resources.jobs), packages at once $(hardware_field resources.emerge_jobs), load $(hardware_field resources.load)"
+    else
+        log "Hardware: $(hardware_field graphics.profile); builds keep this system's make.conf settings"
+    fi
+}
+
+render_hardware_policy() {
+    # The hardware layers come from the saved plan and the selected policy's templates.
+    # They are rendered anew once per run, before any of them is deployed or checked.
+    [[ "$DISTRIBUTION" == gentoo && "${HARDWARE_RENDERED:-0}" != 1 ]] || return 0
+    hardware_tool render --plan "$(hardware_root)/inventory.json" --destination "$(hardware_root)/policy" \
+        --templates "$NEUROGENTOO_ROOT/config/hardware/templates" || die "cannot render the hardware policy"
+    HARDWARE_RENDERED=1
 }
 
 copy_hardware_state() {
@@ -2364,20 +2402,23 @@ copy_hardware_state() {
     fi
 }
 
-emerge_with_resources() { # [--keep-going] EMERGE-ARGUMENTS
-    local jobs load keep_going=n
-    if [[ "${1:-}" == --keep-going ]]; then keep_going=y; shift; fi
-    jobs="$(hardware_field resources.emerge_jobs)" && load="$(hardware_field resources.load)" || die "missing resource budget"
-    [[ "$jobs" =~ ^[1-9][0-9]*$ && "$load" =~ ^[1-9][0-9]*$ ]] || die "invalid resource budget"
-    # Otherwise the first failed build stops the pass, even when make.conf sets a
-    # --keep-going default. Callers that keep going judge the result themselves.
-    run emerge --jobs="$jobs" --load-average="$load" --keep-going="$keep_going" "$@"
+run_emerge() { # [--keep-going] [--one-package] EMERGE-ARGUMENTS
+    local keep_going=n
+    local -a jobs=()
+    while [[ "${1:-}" == --keep-going || "${1:-}" == --one-package ]]; do
+        if [[ "$1" == --keep-going ]]; then keep_going=y; else jobs=(--jobs=1); fi
+        shift
+    done
+    # make.conf decides how many packages build at once; the compiler passes build one
+    # at a time. Without an explicit --keep-going=n the first failed build would not
+    # stop the pass when make.conf sets a --keep-going default. Callers that keep going
+    # judge the result themselves.
+    run emerge "${jobs[@]}" --keep-going="$keep_going" "$@"
 }
 
 phase_hardware_policy() {
     local cpv
     ensure_hardware_plan
-    deploy_policy_layer hardware/auto/resources
     deploy_policy_layer hardware/auto/minimal
     install_policy_sets hardware/auto/minimal
     cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
@@ -2391,7 +2432,7 @@ phase_hardware_policy() {
 }
 
 validate_hardware_policy() {
-    hardware_plan_valid && validate_policy_layer hardware/auto/resources &&
+    hardware_plan_valid &&
         validate_policy_sets hardware/auto/minimal &&
         hardware_field firmware_list >/dev/null 2>&1 && ! firmware_list_outdated && ! firmware_copy_pending
 }
@@ -2453,7 +2494,7 @@ rebuild_firmware_from_list() { # CPV
         [[ -e "$copy.pre-install-system" ]] || cp -p -- "$copy" "$copy.pre-install-system"
         rm -f -- "$copy"
     done
-    emerge_with_resources --oneshot "=$1"
+    run_emerge --oneshot "=$1"
     settle_firmware_copy "$1"
     sha256sum </etc/portage/savedconfig/sys-kernel/linux-firmware | write_file /var/lib/install-system/firmware-list.sha256 0644
 }
@@ -2548,7 +2589,7 @@ validate_portage_source() {
     [[ -f "$source/.install-system-revision" && -s "$source/.install-system-files.sha256" ]] || return 1
     cmp -s "$source/.install-system-revision" <(printf '%s\n%s\n' "$NEUROGENTOO_URL" "$NEUROGENTOO_REF") || return 1
     [[ "$(cat "$source/profiles/repo_name" 2>/dev/null)" == neurogentoo &&
-        "$(cat "$source/config/portage/schema" 2>/dev/null)" == 3 &&
+        "$(cat "$source/config/portage/schema" 2>/dev/null)" =~ ^[34]$ &&
         -s "$source/config/portage/build-state.py" && -d "$source/config/hardware/templates" ]] || return 1
     digest="$(portage_source_digest "$source")" || return 1
     [[ "$digest" == "$(cat "$source/.install-system-files.sha256")" ]]
@@ -2583,14 +2624,14 @@ ensure_portage_source() {
             git -C "$work/git" archive "$NEUROGENTOO_REF" | tar -xf - -C "$work/tree" || exit 1
             [[ -z "$(find "$work/tree" ! -type d ! -type f -print -quit)" ]] || exit 1
             [[ "$(cat "$work/tree/profiles/repo_name")" == neurogentoo &&
-                "$(cat "$work/tree/config/portage/schema")" == 3 &&
+                "$(cat "$work/tree/config/portage/schema")" =~ ^[34]$ &&
                 -s "$work/tree/config/portage/build-state.py" && -d "$work/tree/config/hardware/templates" ]] || exit 1
             printf '%s\n%s\n' "$NEUROGENTOO_URL" "$NEUROGENTOO_REF" >"$work/tree/.install-system-revision" || exit 1
             portage_source_digest "$work/tree" >"$work/tree/.install-system-files.sha256" || exit 1
             chmod -R u=rwX,go=rX "$work/tree" || exit 1
         ); then
             rm -rf -- "$work"
-            die "neurogentoo/$NEUROGENTOO_BRANCH lacks policy schema 3 or could not be fetched; the prepared policy must be published first"
+            die "neurogentoo/$NEUROGENTOO_BRANCH lacks policy schema 3 or 4 or could not be fetched; the prepared policy must be published first"
         fi
         mv -T -- "$work/tree" "$NEUROGENTOO_ROOT"
         rm -rf -- "$work"
@@ -2649,11 +2690,58 @@ policy_file_contents() {
     fi
 }
 
+policy_known_files() {
+    # Every /etc/portage path that a layer of the selected policy provides, the rendered
+    # hardware layers included, whichever tier the layer belongs to.
+    local directory
+    for directory in "$PORTAGE_POLICY" "$(hardware_root)/policy"; do
+        [[ -d "$directory" ]] || continue
+        find "$directory" -type f -printf '%P\n'
+    done | awk -F/ '{
+        for (i = 1; i <= NF; i++)
+            if ($i ~ /^(make\.conf|package\.[a-z_]+|env|sets|repos\.conf|profile|savedconfig|patches)$/) {
+                path = $i
+                for (j = i + 1; j <= NF; j++) path = path "/" $j
+                print path
+                next
+            }
+    }' | LC_ALL=C sort -u
+}
+
+retire_stale_policy_files() {
+    # An earlier policy can have deployed files that the selected one no longer has, such
+    # as the former build-job override. Unchanged ones are removed; edited ones stay.
+    local receipts=/var/lib/install-system/portage-files receipt relative target hash known
+    [[ "$DISTRIBUTION" == gentoo && "${POLICY_RETIRED:-0}" != 1 && -d "$receipts" &&
+        -f "$(hardware_root)/inventory.json" ]] || return 0
+    POLICY_RETIRED=1
+    render_hardware_policy
+    known="$(policy_known_files)" || die "cannot list the Portage policy files"
+    while IFS= read -r receipt; do
+        relative="${receipt#"$receipts/"}"
+        relative="${relative%.sha256}"
+        ! grep -qxF -- "$relative" <<<"$known" || continue
+        target="/etc/portage/$relative"
+        if [[ -f "$target" && ! -L "$target" ]]; then
+            hash="$(sha256sum "$target")"
+            if [[ "${hash%% *}" == "$(cat "$receipt")" ]]; then
+                rm -f -- "$target"
+                log "Removed $target: the Portage policy no longer has it"
+            else
+                warn "Keeping $target: the Portage policy no longer has it, but it was edited"
+            fi
+        fi
+        rm -f -- "$receipt"
+    done < <(find "$receipts" -type f -name '*.sha256' | LC_ALL=C sort)
+}
+
 deploy_policy_layer() {
     local layer="$1" files relative target content hash receipt previous
     local only="${2:-}"
     local receipts=/var/lib/install-system/portage-files
     local -A contents=() backups=() retained=()
+    retire_stale_policy_files
+    [[ "$layer" != hardware/auto/* ]] || render_hardware_policy
     files="$(policy_layer_files "$layer")" || die "missing/invalid Portage policy layer: $layer"
     if [[ -n "$only" ]]; then files="$(printf '%s\n' "$files" | grep -xF "$only")"; fi
     [[ -n "$files" ]] || die "empty Portage policy layer: $layer"
@@ -2720,6 +2808,7 @@ policy_repair_is_retained() {
 
 validate_policy_layer() {
     local layer="$1" files relative content
+    [[ "$layer" != hardware/auto/* || ! -f "$(hardware_root)/inventory.json" ]] || render_hardware_policy
     files="$(policy_layer_files "$layer")" && [[ -n "$files" ]] || return 1
     while IFS= read -r relative; do
         [[ "$(readlink -m "/etc/portage/$relative")" == "/etc/portage/$relative" ]] || return 1
@@ -2745,7 +2834,7 @@ selected_policy_layers() {
 
 install_policy_sets() {
     local layer file directory atom plan changes
-    local -a sets=() keep_going=(--keep-going) core=() apps=() names=()
+    local -a sets=() keep_going=(--keep-going) one_package=() core=() apps=() names=()
     for layer in "$@"; do
         directory="$(policy_layer_directory "$layer")" || die "cannot locate $layer"
         for file in "$directory/sets/"*; do
@@ -2753,8 +2842,9 @@ install_policy_sets() {
             validate_policy_layer "$layer" || die "Portage policy must be deployed before selecting $layer"
             sets+=("@${file##*/}")
         done
-        # Compiler passes stop at the first failure; the later passes build on them.
-        [[ "$layer" != toolchain ]] || keep_going=()
+        # Compiler passes build one package at a time and stop at the first failure; the
+        # later passes build on them.
+        [[ "$layer" != toolchain ]] || { keep_going=(); one_package=(--one-package); }
     done
     ((${#sets[@]})) || die "no package sets selected"
     # Dependencies are resolved first. A failure there needs a repair and is no failed
@@ -2772,7 +2862,7 @@ install_policy_sets() {
     fi
     # Missing packages are installed and the installer's USE flags applied. Installed
     # versions are not upgraded: that remains the job of the system's own world update.
-    if emerge_with_resources "${keep_going[@]}" --changed-use --select "${sets[@]}"; then
+    if run_emerge "${keep_going[@]}" "${one_package[@]}" --changed-use --select "${sets[@]}"; then
         record_missing_packages "$CURRENT_STAGE"
         return 0
     fi
@@ -2970,7 +3060,7 @@ phase_profile() {
             index="${BASH_REMATCH[1]}"
             break
         fi
-    done < <(eselect profile list 2>&1)
+    done < <(eselect profile list 2>&1 || true)
     [[ -n "$index" ]] || die "required profile was not found: $PROFILE_PATH"
     run eselect profile set "$index"
     run env-update
@@ -2989,7 +3079,6 @@ write_portage_fragments() {
 phase_portage() {
     deploy_policy_layer bootstrap
     deploy_policy_layer polly-off
-    deploy_policy_layer hardware/auto/resources
     deploy_policy_layer hardware/auto/minimal
     deploy_policy_layer minimal
     deploy_policy_layer toolchain
@@ -3012,12 +3101,12 @@ phase_base_packages() {
         state_set compiler_policy bootstrap
         mark_pass_prepared
     fi
-    emerge_with_resources --oneshot sys-apps/portage app-portage/cpuid2cpuflags
+    run_emerge --oneshot sys-apps/portage app-portage/cpuid2cpuflags
     if ! grep -q '^CPU_FLAGS_X86=' /etc/portage/make.conf; then deploy_policy_layer bootstrap make.conf; fi
-    emerge_with_resources --select dev-vcs/git
+    run_emerge --select dev-vcs/git
     # One failed package does not stop the others; the pass still ends with an error, and
     # the retry updates only what is left.
-    emerge_with_resources --keep-going --update @world ||
+    run_emerge --keep-going --update @world ||
         die "$CURRENT_STAGE: some packages failed (see the emerge summary above); repair them, then continue"
     run env-update
     record_build_pass 'sys-apps/portage|sys-libs/glibc|sys-devel/gcc|dev-vcs/git'
@@ -3053,7 +3142,7 @@ phase_bootstrap_world() {
         mark_pass_prepared
     fi
     rebuild_world
-    emerge_with_resources --depclean
+    run_emerge --depclean
     record_build_pass 'sys-apps/portage|sys-libs/glibc|sys-devel/gcc'
 }
 
@@ -3070,7 +3159,7 @@ rebuild_world() { # [EXCLUDED-PACKAGES]: one "emerge -e @world" pass of the comp
     [[ -z "${excluded// /}" ]] || arguments+=(--exclude "$excluded")
     # The start time stays until record_build_pass completes the stage, so a later
     # failure (such as depclean) does not restart the whole pass.
-    emerge_with_resources "${arguments[@]}" ||
+    run_emerge "${arguments[@]}" ||
         die "$CURRENT_STAGE: some packages failed (see the emerge summary above); repair them, then continue to rebuild only what is left"
 }
 
@@ -3110,7 +3199,7 @@ phase_prepolly_world() {
         mark_pass_prepared
     fi
     rebuild_world
-    emerge_with_resources --depclean
+    run_emerge --depclean
     record_build_pass
 }
 
@@ -3149,7 +3238,7 @@ phase_gcc_runtime() {
         state_set compiler_policy gcc
         mark_pass_prepared
     fi
-    emerge_with_resources --oneshot llvm-runtimes/clang-runtime
+    run_emerge --one-package --oneshot llvm-runtimes/clang-runtime
     record_build_pass '^llvm-runtimes/clang-runtime$'
 }
 
@@ -3159,7 +3248,7 @@ remove_toolchain_bootstrap_dependencies() {
     for atom in dev-libs/jsoncpp dev-build/cmake; do
         if portageq has_version / "$atom"; then installed+=("$atom"); fi
     done
-    ((${#installed[@]} == 0)) || emerge_with_resources --unmerge "${installed[@]}"
+    ((${#installed[@]} == 0)) || run_emerge --unmerge "${installed[@]}"
 }
 
 rebuild_installed_toolchain() {
@@ -3167,7 +3256,7 @@ rebuild_installed_toolchain() {
     local -a selected=()
     atoms="$(build_state list --pattern 'llvm|rust')"
     mapfile -t selected <<<"$atoms"
-    emerge_with_resources --oneshot "${selected[@]}"
+    run_emerge --one-package --oneshot "${selected[@]}"
     run env-update
     record_build_pass
 }
@@ -3204,7 +3293,7 @@ phase_polly_runtime() {
         state_set compiler_policy polly
         mark_pass_prepared
     fi
-    emerge_with_resources --oneshot llvm-runtimes/clang-runtime
+    run_emerge --one-package --oneshot llvm-runtimes/clang-runtime
     record_build_pass '^llvm-runtimes/clang-runtime$'
 }
 
@@ -3229,8 +3318,8 @@ phase_world_rebuild() {
 }
 
 phase_base_cleanup() {
-    emerge_with_resources @preserved-rebuild
-    emerge_with_resources --depclean
+    run_emerge @preserved-rebuild
+    run_emerge --depclean
     record_build_pass
 }
 
@@ -3261,6 +3350,17 @@ system_policy_services() {
     while read -r service runlevel extra; do
         [[ -n "$service" && "$service" != \#* ]] || continue
         [[ "$service" =~ ^[a-zA-Z0-9_.-]+$ && "$runlevel" =~ ^[a-zA-Z0-9_-]+$ && -z "$extra" ]] || return 1
+        # iwd would fight another network manager for the wireless device, and the
+        # Bluetooth service has nothing to do without an adapter.
+        if [[ "$service" == iwd && -n "$(rc-update show 2>/dev/null |
+            awk '$1 ~ /^(NetworkManager|wpa_supplicant|connman|connmand)$/ {print $1}')" ]]; then
+            [[ "$action" != apply ]] || log "Leaving iwd off: another network manager is enabled"
+            continue
+        fi
+        if [[ "$service" == bluetooth ]] && ! compgen -G '/sys/class/bluetooth/hci*' >/dev/null; then
+            [[ "$action" != apply ]] || log "Leaving bluetooth off: this computer has no Bluetooth adapter"
+            continue
+        fi
         # A service whose package could not be installed waits until continue retries it.
         # An installed package that lost its service script is still an error.
         if [[ "$service" != agetty.tty* && ! -e "/etc/init.d/$service" ]] &&
@@ -3568,7 +3668,7 @@ efi_entry_exists() {
         if [[ "$line_lower" == *gentoo* && "$line_lower" == *"$expected_uuid"* && "$line_lower" == *"$expected_path"* ]]; then
             return 0
         fi
-    done < <(efibootmgr -v 2>/dev/null)
+    done < <(efibootmgr -v 2>/dev/null || true)
     return 1
 }
 
@@ -3685,7 +3785,7 @@ repository_enabled() {
     while IFS= read -r line; do
         read -r index name rest <<<"$line"
         [[ "$index" =~ ^\[[0-9]+\]$ && "$name" == "$repository" ]] && return 0
-    done < <(eselect repository list -i 2>/dev/null)
+    done < <(eselect repository list -i 2>/dev/null || true)
     return 1
 }
 
@@ -3995,7 +4095,7 @@ phase_dwl_build() {
     if ! validate_dwl_package_inputs; then
         # Runtime-only dotfile updates need no rebuild; changed compiled inputs do.
         EGIT_OVERRIDE_COMMIT_NEUR0LEPTIC_DOTFILES="$dotfiles_ref" \
-            emerge_with_resources --oneshot '=gui-wm/dwl-9999::neurogentoo'
+            run_emerge --oneshot '=gui-wm/dwl-9999::neurogentoo'
         validate_dwl_package_inputs || die "rebuilt DWL does not match the synchronized canonical patch/protocol"
     fi
     # start-dwl intentionally uses this existing user-local executable path.
@@ -4042,7 +4142,7 @@ detect_gpg_recipient() {
             return 0
         fi
     done < <(run_as_user env GNUPGHOME="$home/.gnupg" \
-        gpg --batch --with-colons --list-secret-keys 2>/dev/null)
+        gpg --batch --with-colons --list-secret-keys 2>/dev/null || true)
     return 1
 }
 
@@ -4523,6 +4623,7 @@ EOF
         request_wait "restore the GPG private key for the chezmoi recipient, then continue"
         return 0
     fi
+    unlock_private_key "$source" || return 0
     run_as_user install -d -m 0755 "$(dirname "$persistent")"
     private_dotfiles_files apply
     weather="$home/.local/bin/weather.sh"
@@ -4839,7 +4940,7 @@ required_files() {
         done <"$directory/required-files"
     done
     ((found)) || return 1
-    if ((${#repair[@]})); then emerge_with_resources --oneshot "${!repair[@]}"; fi
+    if ((${#repair[@]})); then run_emerge --oneshot "${!repair[@]}"; fi
     [[ "$action" != repair ]] || TOLERATE_MISSING="$PHASE_INCOMPLETE" required_files check "$@"
 }
 
