@@ -2001,12 +2001,12 @@ mount_target_boot() {
 }
 
 phase_target_setup() {
-    local repository_config="$TARGET_MOUNT/etc/portage/repos.conf/gentoo.conf"
+    local repository_config="$TARGET_MOUNT/etc/portage/repos.conf"
     mount_target_boot
     copy_portage_source_to_target
     copy_common_data
-    install -d -m 0755 "$TARGET_MOUNT/etc/portage/repos.conf"
-    if [[ -e "$repository_config" || -L "$repository_config" ]]; then
+    portage_policy migrate --root "$TARGET_MOUNT" --configs-only || die "Portage layout migration stopped; no installation stages were run"
+    if [[ -s "$repository_config" ]]; then
         log "Preserving existing Gentoo repository configuration: $repository_config"
     elif [[ -f "$TARGET_MOUNT/usr/share/portage/config/repos.conf" ]]; then
         run cp -- "$TARGET_MOUNT/usr/share/portage/config/repos.conf" "$repository_config"
@@ -2476,7 +2476,7 @@ phase_hardware_policy() {
     local cpv
     ensure_hardware_plan
     deploy_policy_layer hardware/auto/minimal
-    install_policy_sets hardware/auto/minimal
+    install_policy_packages hardware/auto/minimal
     cpv="$(portageq match / sys-kernel/linux-firmware | tail -n 1)"
     [[ -n "$cpv" ]] && firmware_list_managed || return 0
     # A changed list takes effect when the installed linux-firmware version is rebuilt.
@@ -2489,7 +2489,7 @@ phase_hardware_policy() {
 
 validate_hardware_policy() {
     hardware_plan_valid &&
-        validate_policy_sets hardware/auto/minimal &&
+        validate_policy_packages hardware/auto/minimal &&
         hardware_field firmware_list >/dev/null 2>&1 && ! firmware_list_outdated && ! firmware_copy_pending
 }
 
@@ -2726,7 +2726,44 @@ policy_layer_files() {
     directory="$(policy_layer_directory "$layer")" || return 1
     [[ "$layer" =~ ^[a-z0-9-]+(/[a-z0-9-]+)*$ && -d "$directory" && ! -L "$directory" ]] || return 1
     [[ -z "$(find "$directory" ! -type f ! -type d -print -quit)" ]] || return 1
-    find "$directory" -type f ! -path "$directory/required-files" -printf '%P\n' | LC_ALL=C sort
+    find "$directory" -type f ! -path "$directory/required-files" ! -path "$directory/sets/*" -printf '%P\n' | LC_ALL=C sort
+}
+
+portage_policy() {
+    python3 -B "$COMMON_DATA/portage_policy.py" "$@"
+}
+
+portage_flat_file() {
+    case "${1%%/*}" in
+        package.use|package.env|package.accept_keywords|package.keywords|package.mask|package.unmask|package.license|package.properties|package.accept_restrict|package.bashrc|repos.conf|binrepos.conf) return 0 ;;
+    esac
+    if [[ "$1" == profile/* ]]; then
+        local name="${1#profile/}"
+        case "${name%%/*}" in
+            use.mask|use.force|use.stable.mask|use.stable.force|package.use|package.use.mask|package.use.force|package.use.stable.mask|package.use.stable.force|package.mask|package.unmask|package.accept_keywords|package.provided|packages|package.bashrc) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+policy_package_atoms() {
+    local layer directory file line atom extra
+    for layer in "$@"; do
+        directory="$(policy_layer_directory "$layer")" || return 1
+        for file in "$directory/sets/"*; do
+            [[ -f "$file" && ! -L "$file" ]] || continue
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line%%#*}"
+                read -r atom extra <<<"$line"
+                [[ -n "$atom" ]] || continue
+                [[ -z "$extra" && "$atom" != @* && "$atom" != -* ]] || {
+                    warn "invalid package-list entry in $file: $line"
+                    return 1
+                }
+                printf '%s\n' "$atom"
+            done <"$file"
+        done
+    done
 }
 
 policy_file_contents() {
@@ -2768,14 +2805,17 @@ retire_stale_policy_files() {
     # An earlier policy can have deployed files that the selected one no longer has, such
     # as the former build-job override. Unchanged ones are removed; edited ones stay.
     local receipts=/var/lib/install-system/portage-files receipt relative target hash known
-    [[ "$DISTRIBUTION" == gentoo && "${POLICY_RETIRED:-0}" != 1 && -d "$receipts" &&
+    [[ "$DISTRIBUTION" == gentoo && "${POLICY_RETIRED:-0}" != 1 &&
+        ( -d "$receipts" || -f /var/lib/install-system/portage-flat.json ) &&
         -f "$(hardware_root)/inventory.json" ]] || return 0
     POLICY_RETIRED=1
     render_hardware_policy
     known="$(policy_known_files)" || die "cannot list the Portage policy files"
+    portage_policy retire <<<"$known" || die "could not safely retire the old Portage rules"
     while IFS= read -r receipt; do
         relative="${receipt#"$receipts/"}"
         relative="${relative%.sha256}"
+        if portage_flat_file "$relative" || [[ "$relative" == sets/* ]]; then continue; fi
         ! grep -qxF -- "$relative" <<<"$known" || continue
         target="/etc/portage/$relative"
         if [[ -f "$target" && ! -L "$target" ]]; then
@@ -2795,12 +2835,13 @@ deploy_policy_layer() {
     local layer="$1" files relative target content hash receipt previous
     local only="${2:-}"
     local receipts=/var/lib/install-system/portage-files
+    local staged=""
     local -A contents=() backups=() retained=()
     retire_stale_policy_files
     [[ "$layer" != hardware/auto/* ]] || render_hardware_policy
     files="$(policy_layer_files "$layer")" || die "missing/invalid Portage policy layer: $layer"
     if [[ -n "$only" ]]; then files="$(printf '%s\n' "$files" | grep -xF "$only")"; fi
-    [[ -n "$files" ]] || die "empty Portage policy layer: $layer"
+    [[ -n "$files" ]] || return 0  # A package-list-only layer has no target configuration.
     # Check the entire layer before replacing any files or converting file-form
     # configuration. A late conflict must not leave half of a compiler policy.
     while IFS= read -r relative; do
@@ -2810,6 +2851,16 @@ deploy_policy_layer() {
         [[ "$(readlink -m "$target")" == "$target" ]] || die "symlinked policy destination: $target"
         content="$(policy_file_contents "$layer" "$relative")" || die "cannot render $layer/$relative"
         contents["$relative"]="$content"
+        if portage_flat_file "$relative"; then
+            if [[ -z "$staged" ]]; then staged="$(mktemp -d /var/lib/install-system/.portage-input.XXXXXX)"; fi
+            install -d -m 0700 "$staged/$(dirname "$relative")"
+            printf '%s\n' "$content" >"$staged/$relative"
+            continue
+        fi
+        case "$relative" in
+            package.*/*|repos.conf/*|binrepos.conf/*|profile/use.*/*|profile/package.*/*)
+                die "unsupported fragmented Portage setting: $relative" ;;
+        esac
         receipt="$receipts/$relative.sha256"
         if [[ -e "$target" ]]; then
             [[ -f "$target" ]] || die "policy destination is not a file: $target"
@@ -2831,22 +2882,24 @@ deploy_policy_layer() {
             fi
         fi
     done <<<"$files"
+    if [[ -n "$staged" ]]; then
+        portage_policy apply --input "$staged" --check-only || die "Portage policy conflicts with local settings; no files from this layer were replaced"
+        portage_policy apply --input "$staged" || die "Portage policy deployment stopped; its pending record will be checked on resume"
+    fi
     while IFS= read -r relative; do
+        if portage_flat_file "$relative"; then continue; fi
         if [[ -v "retained[$relative]" ]]; then
             log "Retaining manual Portage repair: /etc/portage/$relative"
             continue
         fi
         target="/etc/portage/$relative"
-        case "$relative" in
-            package.*/*|repos.conf/*) portage_fragment_path "${relative%%/*}" >/dev/null ;;
-            profile/use.*/*) portage_fragment_path "${relative%/*}" >/dev/null ;;
-        esac
         [[ ! -v "backups[$relative]" ]] || cp -p -- "$target" "$target.pre-install-system"
         printf '%s\n' "${contents[$relative]}" | write_file "$target" 0644
         receipt="$receipts/$relative.sha256"
         hash="$(sha256sum "$target")"
         printf '%s\n' "${hash%% *}" | write_file "$receipt" 0600
     done <<<"$files"
+    [[ -z "$staged" ]] || rm -rf -- "$staged"
 }
 
 policy_repair_is_retained() {
@@ -2865,11 +2918,16 @@ policy_repair_is_retained() {
 validate_policy_layer() {
     local layer="$1" files relative content
     [[ "$layer" != hardware/auto/* || ! -f "$(hardware_root)/inventory.json" ]] || render_hardware_policy
-    files="$(policy_layer_files "$layer")" && [[ -n "$files" ]] || return 1
+    files="$(policy_layer_files "$layer")" || return 1
+    [[ -n "$files" ]] || return 0
     while IFS= read -r relative; do
+        content="$(policy_file_contents "$layer" "$relative")" || return 1
+        if portage_flat_file "$relative"; then
+            printf '%s\n' "$content" | portage_policy check --relative "$relative" || return 1
+            continue
+        fi
         [[ "$(readlink -m "/etc/portage/$relative")" == "/etc/portage/$relative" ]] || return 1
         [[ -f "/etc/portage/$relative" && ! -L "/etc/portage/$relative" ]] || return 1
-        content="$(policy_file_contents "$layer" "$relative")" || return 1
         cmp -s "/etc/portage/$relative" <(printf '%s\n' "$content") || \
             policy_repair_is_retained "$relative" "$content" || return 1
     done <<<"$files"
@@ -2888,24 +2946,22 @@ selected_policy_layers() {
     esac
 }
 
-install_policy_sets() {
-    local layer file directory atom plan changes
-    local -a sets=() keep_going=(--keep-going) one_package=() core=() apps=() names=()
+install_policy_packages() {
+    local layer atom plan changes
+    local atoms
+    local -a packages=() keep_going=(--keep-going) one_package=() core=() apps=() names=()
     for layer in "$@"; do
-        directory="$(policy_layer_directory "$layer")" || die "cannot locate $layer"
-        for file in "$directory/sets/"*; do
-            [[ -f "$file" ]] || continue
-            validate_policy_layer "$layer" || die "Portage policy must be deployed before selecting $layer"
-            sets+=("@${file##*/}")
-        done
+        validate_policy_layer "$layer" || die "Portage policy must be deployed before selecting $layer"
         # Compiler passes build one package at a time and stop at the first failure; the
         # later passes build on them.
         [[ "$layer" != toolchain ]] || { keep_going=(); one_package=(--one-package); }
     done
-    ((${#sets[@]})) || die "no package sets selected"
+    atoms="$(policy_package_atoms "$@")" || die "invalid package lists"
+    [[ -n "$atoms" ]] || die "no packages selected"
+    mapfile -t packages < <(printf '%s\n' "$atoms" | awk '!seen[$0]++')
     # Dependencies are resolved first. A failure there needs a repair and is no failed
     # build, so it stops the installation with Portage's own explanation.
-    if ! plan="$(emerge --pretend --quiet --color=n --nospinner --changed-use --select "${sets[@]}" 2>&1)"; then
+    if ! plan="$(emerge --pretend --quiet --color=n --nospinner --changed-use --select "${packages[@]}" 2>&1)"; then
         printf '%s\n' "$plan" >&2
         die "Portage could not resolve these packages (see its explanation above); repair that, then continue"
     fi
@@ -2918,7 +2974,7 @@ install_policy_sets() {
     fi
     # Missing packages are installed and the installer's USE flags applied. Installed
     # versions are not upgraded: that remains the job of the system's own world update.
-    if run_emerge "${keep_going[@]}" "${one_package[@]}" --changed-use --select "${sets[@]}"; then
+    if run_emerge "${keep_going[@]}" "${one_package[@]}" --changed-use --select "${packages[@]}"; then
         record_missing_packages "$CURRENT_STAGE"
         return 0
     fi
@@ -2937,17 +2993,14 @@ install_policy_sets() {
     fi
 }
 
-missing_policy_packages() { # LAYER...: "LAYER<TAB>ATOM" for every set package that is not installed
-    local layer directory file atom
+missing_policy_packages() { # LAYER...: "LAYER<TAB>ATOM" for every requested package that is not installed
+    local layer atom atoms
     for layer in "$@"; do
-        directory="$(policy_layer_directory "$layer")" || return 1
-        for file in "$directory/sets/"*; do
-            [[ -f "$file" ]] || continue
-            while IFS= read -r atom || [[ -n "$atom" ]]; do
-                [[ -n "$atom" && "$atom" != \#* && "$atom" != @* ]] || continue
-                portageq has_version / "$atom" || printf '%s\t%s\n' "$layer" "$atom"
-            done <"$file"
-        done
+        atoms="$(policy_package_atoms "$layer")" || return 1
+        [[ -n "$atoms" ]] || continue
+        while IFS= read -r atom; do
+            portageq has_version / "$atom" || printf '%s\t%s\n' "$layer" "$atom"
+        done <<<"$atoms"
     done
 }
 
@@ -3045,41 +3098,23 @@ report_missing_packages() {
     } >&2
 }
 
-validate_policy_sets() {
-    local layer file atom directory found=0 check_selection=1
+validate_policy_packages() {
+    local layer atom atoms found=0 check_selection=1
     if [[ "${1:-}" == --installed-only ]]; then check_selection=0; shift; fi
     for layer in "$@"; do
         validate_policy_layer "$layer" || return 1
-        directory="$(policy_layer_directory "$layer")" || return 1
-        for file in "$directory/sets/"*; do
-            [[ -f "$file" ]] || continue
-            ((check_selection == 0)) || grep -qxF "@${file##*/}" /var/lib/portage/world_sets || return 1
-            while IFS= read -r atom || [[ -n "$atom" ]]; do
-                [[ -n "$atom" && "$atom" != \#* ]] || continue
-                [[ "$atom" != @* ]] || return 1
-                portageq has_version / "$atom" || tolerated "$(package_name "$atom")" || return 1
-                found=1
-            done <"$file"
-        done
+        atoms="$(policy_package_atoms "$layer")" || return 1
+        [[ -n "$atoms" ]] || continue
+        while IFS= read -r atom; do
+            portageq has_version / "$atom" || tolerated "$(package_name "$atom")" || return 1
+            found=1
+        done <<<"$atoms"
     done
-    ((found))
-}
-
-portage_fragment_path() {
-    local name="$1" directory="/etc/portage/$1" preserved
-    [[ ! -L "$directory" ]] || die "symlinked Portage configuration is unsupported: $directory"
-    if [[ -f "$directory" ]]; then
-        preserved="${directory}.pre-install-system"
-        [[ ! -e "$preserved" && ! -L "$preserved" ]] || die "cannot preserve $directory: $preserved already exists"
-        mv "$directory" "$preserved"
-        install -d -m 0755 "$directory"
-        mv "$preserved" "$directory/00-pre-install-system"
-    elif [[ -e "$directory" && ! -d "$directory" ]]; then
-        die "unsupported Portage configuration object: $directory"
-    else
-        install -d -m 0755 "$directory"
+    ((found)) || return 1
+    if ((check_selection)); then
+        atoms="$(policy_package_atoms "$@")" || return 1
+        portage_policy selected <<<"$atoms" || return 1
     fi
-    printf '%s/install-system' "$directory"
 }
 
 phase_target_preflight() {
@@ -3128,7 +3163,7 @@ validate_profile() {
     [[ "$profile" == *"/$PROFILE_PATH" && "$profile" != *systemd* ]]
 }
 
-write_portage_fragments() {
+write_portage_policy() {
     deploy_policy_layer base
 }
 
@@ -3146,7 +3181,7 @@ validate_portage() {
     # Compiler/USE edits are legitimate manual recovery inputs. Never roll them
     # back by replaying bootstrap when a later compilation fails.
     [[ -s /var/lib/install-system/build-passes/portage.prepared && -s /etc/portage/make.conf &&
-       -s /etc/portage/sets/install-minimal && -s /etc/portage/sets/install-toolchain ]] &&
+       -d "$PORTAGE_POLICY/minimal/sets" && -d "$PORTAGE_POLICY/toolchain/sets" ]] &&
         hardware_plan_valid
 }
 
@@ -3235,13 +3270,13 @@ PY
 
 phase_toolchain_bootstrap() {
     if ! pass_prepared; then
-        write_portage_fragments
+        write_portage_policy
         deploy_policy_layer prepolly
         deploy_policy_layer polly-off
         state_set compiler_policy prepolly
         mark_pass_prepared
     fi
-    install_policy_sets minimal hardware/auto/minimal toolchain
+    install_policy_packages minimal hardware/auto/minimal toolchain
     run env-update
     record_build_pass
 }
@@ -3262,28 +3297,7 @@ phase_prepolly_world() {
 toggle_no_polly() {
     # Comment only active entries and remember exactly which lines we changed.
     # Existing manual comments and all other package exceptions survive the pass.
-    python3 - "$1" /etc/portage/package.env/install-system-compiler /var/lib/install-system/portage-files/package.env/install-system-compiler.sha256 <<'PY'
-from pathlib import Path
-import hashlib
-import re
-import sys
-path = Path(sys.argv[2])
-receipt = Path(sys.argv[3])
-managed = receipt.is_file() and receipt.read_text().strip() == hashlib.sha256(path.read_bytes()).hexdigest()
-prefix = '# install-system-gcc: '
-lines = path.read_text().splitlines(keepends=True)
-if sys.argv[1] == 'off':
-    lines = [prefix + line if not line.lstrip().startswith('#') and
-             re.search(r'\sno_polly(?:\s|$)', line) else line for line in lines]
-else:
-    lines = [line[len(prefix):] if line.startswith(prefix) else line for line in lines]
-temporary = path.with_suffix('.tmp')
-temporary.write_text(''.join(lines))
-temporary.chmod(0o644)
-temporary.replace(path)
-if managed:
-    receipt.write_text(hashlib.sha256(path.read_bytes()).hexdigest() + '\n')
-PY
+    if [[ "$1" == off ]]; then portage_policy toggle --enabled no; else portage_policy toggle --enabled yes; fi
 }
 
 phase_gcc_runtime() {
@@ -3380,7 +3394,7 @@ phase_base_cleanup() {
 }
 
 validate_base_packages() {
-    validate_build_pass base-cleanup && validate_policy_sets minimal toolchain hardware/auto/minimal &&
+    validate_build_pass base-cleanup && validate_policy_packages minimal toolchain hardware/auto/minimal &&
         command -v clang >/dev/null && command -v ld.lld >/dev/null &&
         command -v rustc >/dev/null && command -v cargo >/dev/null &&
         command -v git >/dev/null &&
@@ -3624,7 +3638,7 @@ phase_kernel_config() {
     # kernel choice installed them with the minimal set instead.
     if [[ -d "$PORTAGE_POLICY/kernel/custom" ]]; then
         deploy_policy_layer kernel/custom
-        validate_policy_sets kernel/custom || install_policy_sets kernel/custom
+        validate_policy_packages kernel/custom || install_policy_packages kernel/custom
     fi
     if ((KERNEL_CONFIG_READY == 0)) && [[ -s "$waiting" ]] && ((NON_INTERACTIVE == 0)); then
         local answer
@@ -3667,7 +3681,7 @@ phase_kernel() {
         # uefi-mkconfig reads the command line while the kernel package installs.
         system_policy apply kernel etc/default/uefi-mkconfig
         deploy_policy_layer kernel/dist
-        install_policy_sets kernel/dist
+        install_policy_packages kernel/dist
         dist_kernel_installed || die "the distribution kernel and its initramfs are not on the ESP"
         return 0
     fi
@@ -3704,7 +3718,7 @@ kernel_modules_installed() {
 
 validate_kernel() {
     if [[ "$KERNEL_CHOICE" == dist ]]; then
-        validate_policy_sets kernel/dist && system_policy check kernel etc/default/uefi-mkconfig &&
+        validate_policy_packages kernel/dist && system_policy check kernel etc/default/uefi-mkconfig &&
             dist_kernel_installed
         return
     fi
@@ -3845,7 +3859,7 @@ repository_enabled() {
     return 1
 }
 
-write_desktop_portage_fragments() {
+write_desktop_portage_policy() {
     local layer
     local -a POLICY_LAYERS=()
     selected_policy_layers dwl
@@ -3854,7 +3868,7 @@ write_desktop_portage_fragments() {
 
 phase_desktop_repositories() {
     deploy_policy_layer repository-tools
-    install_policy_sets repository-tools
+    install_policy_packages repository-tools
     ensure_neurogentoo_repository
     deploy_policy_layer overlay
     validate_neurogentoo_sync_policy || die "conflicting Portage neurogentoo sync settings; preserve/reconcile them before syncing"
@@ -3870,7 +3884,7 @@ phase_desktop_repositories() {
     run emaint sync -r librewolf
     [[ "$(git -C /var/db/repos/librewolf remote get-url origin)" == "$LIBREWOLF_REPOSITORY_URL" ]] || \
         die "unexpected LibreWolf repository origin"
-    write_desktop_portage_fragments
+    write_desktop_portage_policy
 }
 
 neurogentoo_checkout_is_safe() {
@@ -3951,7 +3965,7 @@ sys.exit(0 if valid else 1)
 validate_desktop_repositories() {
     local layer
     local -a POLICY_LAYERS=()
-    validate_policy_sets repository-tools || return 1
+    validate_policy_packages repository-tools || return 1
     validate_policy_layer overlay || return 1
     validate_overlay_registration || return 1
     selected_policy_layers dwl
@@ -3964,7 +3978,7 @@ validate_desktop_repositories() {
 phase_desktop_packages() {
     local -a POLICY_LAYERS=()
     selected_policy_layers dwl
-    install_policy_sets "${POLICY_LAYERS[@]}"
+    install_policy_packages "${POLICY_LAYERS[@]}"
     required_files repair "${POLICY_LAYERS[@]}"
     system_policy_services apply dwl
 
@@ -3998,7 +4012,7 @@ ssh_client_reads_rsa() {
 validate_desktop_packages() {
     local -a POLICY_LAYERS=()
     selected_policy_layers dwl
-    validate_policy_sets "${POLICY_LAYERS[@]}" || return 1
+    validate_policy_packages "${POLICY_LAYERS[@]}" || return 1
     local group groups policy_groups
     required_files check "${POLICY_LAYERS[@]}" || return 1
     groups=" $(id -nG "$USERNAME") " || return 1
@@ -4145,7 +4159,7 @@ phase_dwl_build() {
     dotfiles_ref="$(public_dotfiles_revision)" || die "could not resolve the synchronized public dotfiles revision"
     if [[ "${FORCE_STAGE:-none}" == "$CURRENT_STAGE" ]] || ! validate_dwl_packaged_apps; then
         deploy_policy_layer dwl-apps
-        EGIT_OVERRIDE_COMMIT_NEUR0LEPTIC_DOTFILES="$dotfiles_ref" install_policy_sets dwl-apps
+        EGIT_OVERRIDE_COMMIT_NEUR0LEPTIC_DOTFILES="$dotfiles_ref" install_policy_packages dwl-apps
         required_files repair dwl-apps
     fi
     if ! validate_dwl_package_inputs; then
@@ -4170,7 +4184,7 @@ public_dotfiles_revision() {
 
 validate_dwl_packaged_apps() {
     # The layer's required files list these executables.
-    validate_policy_sets dwl-apps &&
+    validate_policy_packages dwl-apps &&
         packaged_commands_are_unshadowed dwl yazi ya clipse timer ripdrag wayland-pipewire-idle-inhibit unimatrix &&
         [[ -x /usr/bin/dwl ]] &&
         required_files check dwl-apps
@@ -4895,7 +4909,7 @@ phase_full_packages() {
     local -a POLICY_LAYERS=()
     selected_policy_layers full
     for layer in "${POLICY_LAYERS[@]}"; do deploy_policy_layer "$layer"; done
-    install_policy_sets "${POLICY_LAYERS[@]}"
+    install_policy_packages "${POLICY_LAYERS[@]}"
     required_files repair "${POLICY_LAYERS[@]}"
     if [[ "$TORRENT" == yes ]]; then system_policy apply torrent etc/init.d/flaresolverr; fi
 }
@@ -4903,7 +4917,7 @@ phase_full_packages() {
 validate_full_packages() {
     local -a POLICY_LAYERS=()
     selected_policy_layers full
-    validate_policy_sets "${POLICY_LAYERS[@]}" || return 1
+    validate_policy_packages "${POLICY_LAYERS[@]}" || return 1
     required_files check "${POLICY_LAYERS[@]}" || return 1
     [[ "$TORRENT" != yes ]] || system_policy check torrent etc/init.d/flaresolverr || return 1
     local command encoders
@@ -4937,13 +4951,13 @@ phase_source_apps() {
         return 0
     fi
     deploy_policy_layer source-apps
-    install_policy_sets source-apps
+    install_policy_packages source-apps
     required_files repair source-apps
 }
 
 validate_source_apps() {
     # The layer's required files list the nchat, wiki-tui and sendme executables.
-    validate_policy_sets source-apps &&
+    validate_policy_packages source-apps &&
         packaged_commands_are_unshadowed nchat wiki-tui sendme &&
         required_files check source-apps
 }
@@ -5008,13 +5022,13 @@ phase_binary_apps() {
         return 0
     fi
     deploy_policy_layer binary-apps
-    install_policy_sets binary-apps
+    install_policy_packages binary-apps
     required_files repair binary-apps
 }
 
 validate_binary_apps() {
     # The layer's required files cover the executables and their ELF format under /usr/bin.
-    validate_policy_sets binary-apps &&
+    validate_policy_packages binary-apps &&
         packaged_commands_are_unshadowed opencode localsend &&
         required_files check binary-apps &&
         { tolerated net-misc/localsend-bin || elf64_x86_64_is_valid /opt/localsend/localsend_app; }
@@ -5350,6 +5364,7 @@ run_target_install() {
     ensure_portage_source
     [[ "$MODE" != new ]] || ensure_hardware_plan
     collect_answers
+    portage_policy migrate || die "Portage layout migration stopped; no installation stages were run"
     local -a sequence=()
     if [[ "$MODE" == "new" ]]; then
         sequence+=("${MINIMAL_SEQUENCE[@]}")
@@ -5970,7 +5985,7 @@ copy_common_data() {
     # The shared helpers belong to the running installer version, like the copied script,
     # so a resume with an updated installer updates them too.
     local destination="$TARGET_MOUNT/usr/local/share/install-system/common" temporary
-    [[ -s "$COMMON_DATA/hardware.py" && -s "$COMMON_DATA/displays.py" && -s "$COMMON_DATA/browser-extensions.sh" ]] || die "keep packaging/common beside the installer"
+    [[ -s "$COMMON_DATA/hardware.py" && -s "$COMMON_DATA/displays.py" && -s "$COMMON_DATA/browser-extensions.sh" && -s "$COMMON_DATA/portage_policy.py" ]] || die "keep packaging/common beside the installer"
     install -d -m 0755 "$(dirname "$destination")"
     [[ ! -L "$destination" ]] || die "shared installation inputs must not be a symlink: $destination"
     common_data_matches "$destination" && return 0

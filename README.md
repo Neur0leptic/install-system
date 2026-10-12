@@ -107,6 +107,19 @@ On Gentoo, linux-firmware can be limited to the files this computer's drivers us
 list is kept as `/etc/portage/savedconfig/sys-kernel/linux-firmware`, which applies to
 every linux-firmware version.
 
+Gentoo's `package.*`, repository and local-profile settings are single files.
+Packages are selected normally in `world`; installer package lists stay in its policy
+snapshot, not `/etc/portage/sets`. Continuing an older installation migrates its
+fragment directories and installer sets, preserving local settings and package choices.
+Originals are backed up under `/var/lib/install-system/portage-backups`.
+From the installer directory, validate first, then migrate without running installation
+stages or package transactions. Do not run this alongside another installer or emerge:
+
+```sh
+doas python3 -B packaging/common/portage_policy.py migrate --check-only
+doas python3 -B packaging/common/portage_policy.py migrate
+```
+
 Browser setup applies themes and configures automatic extension installation for
 LibreWolf and Helium. It also runs LibreWolf's setup script.
 
