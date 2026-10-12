@@ -21,6 +21,7 @@ readonly COMMON_DATA
 readonly DEFAULT_STATE_FILE="/var/lib/install-system/state"
 readonly DEFAULT_TARGET_MOUNT="/mnt/gentoo"
 readonly RUN_LOCK_FILE="/run/install-system/lock"
+readonly PASSPHRASE_KEY="install-system:private-dotfiles-gpg"
 readonly PROFILE_PATH="default/linux/amd64/23.0/no-multilib"
 readonly STAGE_BASE_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds"
 readonly STAGE_LATEST_FILE="latest-stage3-amd64-nomultilib-openrc.txt"
@@ -178,6 +179,10 @@ export -n ACCOUNT_PASSWORD
 # Asked at the start for a new Mullvad device; never written to state, logs or arguments.
 MULLVAD_ACCOUNT=""
 export -n MULLVAD_ACCOUNT
+# The private dotfiles' GPG passphrase, asked once; root's kernel keyring keeps it for
+# later runs. Never written to state, logs or arguments.
+PRIVATE_KEY_PASSPHRASE=""
+export -n PRIVATE_KEY_PASSPHRASE
 RESUME_QUESTION_DONE=0
 DRY_RUN=0
 NON_INTERACTIVE=0
@@ -240,8 +245,10 @@ Safety:
   --dry-run prints only a phase plan. It never runs phase bodies.
   Choose DELETE_EVERYTHING or SKIP (prepared root and EFI partitions).
   Passwords, the Mullvad account number and GPG material are never saved in installer
-  state. A GitHub key made at the start of a new installation waits in the root-only
-  installer directory until its account exists.
+  state. The GPG key's passphrase is asked once and waits in root's kernel keyring
+  until the installation completes, the computer restarts or a day passes unused. A
+  GitHub key made at the start of a new installation waits in the root-only installer
+  directory until its account exists.
 EOF
 }
 
@@ -1363,23 +1370,72 @@ run_as_user() { # [--stdin] COMMAND...: --stdin passes the caller's input instea
         /bin/sh -c 'umask 022; exec "$@"' sh "$@" <"$input"
 }
 
-unlock_private_key() { # SOURCE: the private dotfiles key's passphrase, cached in gpg-agent
-    # pinentry needs a terminal, which the installer's user commands do not have. A missing
-    # passphrase is therefore read here and given to gpg once on its standard input.
-    local source="$1" probe passphrase
+unlock_private_key() { # SOURCE [--no-prompt]: the private dotfiles key's passphrase, cached in gpg-agent
+    # pinentry needs a terminal, which the installer's user commands do not have. The
+    # passphrase is asked once and given to gpg on its standard input whenever gpg-agent
+    # has forgotten it; --no-prompt only reuses one given earlier.
+    local source="$1" probe passphrase attempt
     probe="$(head -n 1 "$source/private-source-allowlist.txt" 2>/dev/null)" || return 0
     [[ "$probe" == */encrypted_*.asc && -f "$source/$probe" && ! -L "$source/$probe" ]] || return 0
+    [[ -n "$GPG_RECIPIENT" ]] && run_as_user gpg --batch --list-secret-keys "$GPG_RECIPIENT" >/dev/null 2>&1 || return 0
     run_as_user gpg --batch --quiet --pinentry-mode error --decrypt "$source/$probe" >/dev/null 2>&1 && return 0
+    passphrase="$(saved_passphrase)"
+    if [[ -n "$passphrase" ]]; then
+        if give_passphrase "$source/$probe" "$passphrase"; then
+            save_passphrase "$passphrase"
+            return 0
+        fi
+        forget_passphrase
+    fi
+    [[ "${2:-}" != --no-prompt ]] || return 1
     if ((NON_INTERACTIVE)); then
         request_wait "unlock the private dotfiles' GPG key in the account's gpg-agent, then continue"
         return 1
     fi
-    IFS= read -r -s -p 'Passphrase of the GPG key for the private dotfiles: ' passphrase </dev/tty ||
-        die "passphrase input ended"
-    printf '\n' >/dev/tty
+    for attempt in 1 2 3; do
+        IFS= read -r -s -p 'Passphrase of the GPG key for the private dotfiles: ' passphrase </dev/tty ||
+            die "passphrase input ended"
+        printf '\n' >/dev/tty
+        if give_passphrase "$source/$probe" "$passphrase"; then
+            save_passphrase "$passphrase"
+            return 0
+        fi
+        ((attempt == 3)) || printf 'The passphrase did not unlock the GPG key; try again.\n' >/dev/tty
+    done
+    die "the passphrase did not unlock the GPG key; run continue to try again"
+}
+
+give_passphrase() { # FILE PASSPHRASE: one decryption through loopback, so gpg-agent caches it
     run_as_user --stdin gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 0 \
-        --decrypt "$source/$probe" >/dev/null < <(printf '%s' "$passphrase") ||
-        die "the passphrase did not unlock the GPG key; run continue to try again"
+        --decrypt "$1" >/dev/null 2>&1 < <(printf '%s' "$2" || true)
+}
+
+passphrase_keyring() { # SCRIPT [ARGUMENT...]: keyctl commands on root's user keyring
+    # They run in a new session keyring that links root's user keyring: its keys stay
+    # usable whichever session keyring sudo or doas passed on, and no session shared
+    # with other processes gains access to them.
+    command -v keyctl >/dev/null || return 1
+    keyctl session - /bin/sh -c "keyctl link @u @s >/dev/null || exit 1; $1" sh "${@:2}"
+}
+
+saved_passphrase() { # the passphrase given earlier in this run or kept by an earlier one
+    if [[ -n "$PRIVATE_KEY_PASSPHRASE" ]]; then
+        printf '%s' "$PRIVATE_KEY_PASSPHRASE"
+    else
+        passphrase_keyring 'keyctl pipe "$(keyctl search @u user "$1")"' "$PASSPHRASE_KEY" 2>/dev/null || true
+    fi
+}
+
+save_passphrase() { # PASSPHRASE: kept until a day without use, a restart or the end of the installation
+    PRIVATE_KEY_PASSPHRASE="$1"
+    command -v keyctl >/dev/null || return 0
+    passphrase_keyring 'keyctl timeout "$(keyctl padd user "$1" @u)" 86400' "$PASSPHRASE_KEY" \
+        < <(printf '%s' "$1" || true) >/dev/null 2>&1 || true
+}
+
+forget_passphrase() {
+    PRIVATE_KEY_PASSPHRASE=""
+    passphrase_keyring 'keyctl invalidate "$(keyctl search @u user "$1")"' "$PASSPHRASE_KEY" >/dev/null 2>&1 || true
 }
 
 request_wait() {
@@ -4480,6 +4536,7 @@ private_dotfiles_files() {
     local source="$home/.local/share/chezmoi-private" persistent="$home/.local/state/chezmoi-private.boltdb"
     local -a managed_targets=() private_targets=() scope=()
     [[ "$action" == apply || "$action" == verify ]] || return 1
+    unlock_private_key "$source" --no-prompt || true
     # Full preferences can enable additional targets after the desktop receipt.
     # The desktop stage owns only its original, feature-independent subset.
     if [[ "$stage" == private-dotfiles ]]; then
@@ -4717,6 +4774,7 @@ phase_wireguard() {
                         request_wait "the private dotfiles have no WireGuard identity \"$identity\"; continue asks again"
                         return 0
                     fi
+                    unlock_private_key "$home/.local/share/chezmoi-private" || return 0
                     install_private_wireguard_identity "$identity"
                     ;;
                 mullvad) register_mullvad_device || return 0 ;;
@@ -5183,6 +5241,8 @@ collect_private_answers() {
     fi
     [[ "${STATE[gpg_recipient]:-}" == "$GPG_RECIPIENT" ]] || state_set gpg_recipient "$GPG_RECIPIENT"
     if account_exists; then
+        # Asked now, so that stages decrypting hours later need no one at the keyboard.
+        unlock_private_key "/home/$USERNAME/.local/share/chezmoi-private"
         # A key made at the start of a new installation is this machine's key.
         if [[ -f "$(github_key_handoff)/id_ed25519_github" ]]; then
             ensure_github_known_host
@@ -5300,6 +5360,7 @@ run_target_install() {
     run_sequence "${sequence[@]}"
 
     if ((STOP_REQUESTED == 0)); then
+        forget_passphrase
         log "Full System is complete."
     fi
 }
@@ -6595,7 +6656,10 @@ arch_run_target() {
         sequence=("${ordered[@]}")
     fi
     run_sequence "${sequence[@]}"
-    ((STOP_REQUESTED)) || log "Arch full installation is complete ($DESKTOP)."
+    if ((STOP_REQUESTED == 0)); then
+        forget_passphrase
+        log "Arch full installation is complete ($DESKTOP)."
+    fi
 }
 
 main() {

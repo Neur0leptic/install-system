@@ -61,6 +61,8 @@ boot configuration.
 Every question of the chosen tier is asked at the start and recorded, so the
 installation then runs on its own. It stops only for manual work, such as configuring
 a custom kernel or restoring the GPG key of the private dotfiles, or for a repair.
+The passphrase of that GPG key is asked only once; root's kernel keyring keeps it
+until the installation completes, the computer restarts or a day passes unused.
 
 ## Resuming work
 
