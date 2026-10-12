@@ -4932,7 +4932,7 @@ elf64_x86_64_is_valid() {
 }
 
 phase_source_apps() {
-    if ! packaged_commands_are_unshadowed nchat wiki-tui croc; then
+    if ! packaged_commands_are_unshadowed nchat wiki-tui sendme; then
         request_wait "source-apps needs local executable path conflicts resolved"
         return 0
     fi
@@ -4942,9 +4942,9 @@ phase_source_apps() {
 }
 
 validate_source_apps() {
-    # The layer's required files list the nchat, wiki-tui and croc executables.
+    # The layer's required files list the nchat, wiki-tui and sendme executables.
     validate_policy_sets source-apps &&
-        packaged_commands_are_unshadowed nchat wiki-tui croc &&
+        packaged_commands_are_unshadowed nchat wiki-tui sendme &&
         required_files check source-apps
 }
 
@@ -5003,7 +5003,7 @@ required_files() {
 }
 
 phase_binary_apps() {
-    if ! packaged_commands_are_unshadowed opencode shfmt localsend; then
+    if ! packaged_commands_are_unshadowed opencode localsend; then
         request_wait "binary-apps needs local executable path conflicts resolved"
         return 0
     fi
@@ -5015,7 +5015,7 @@ phase_binary_apps() {
 validate_binary_apps() {
     # The layer's required files cover the executables and their ELF format under /usr/bin.
     validate_policy_sets binary-apps &&
-        packaged_commands_are_unshadowed opencode shfmt localsend &&
+        packaged_commands_are_unshadowed opencode localsend &&
         required_files check binary-apps &&
         { tolerated net-misc/localsend-bin || elf64_x86_64_is_valid /opt/localsend/localsend_app; }
 }
