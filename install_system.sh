@@ -3074,6 +3074,15 @@ missing_for_stage() { # CATEGORY/NAME...: true, leaving the stage incomplete, wh
     return 1
 }
 
+installation_has_missing_packages() {
+    local stage
+    [[ ! -s "$(missing_packages_file)" ]] || return 0
+    for stage in "${DWL_STAGES[@]}" "${FULL_STAGES[@]}"; do
+        [[ "$(state_stage_status "$stage")" != incomplete ]] || return 0
+    done
+    return 1
+}
+
 report_missing_packages() {
     # Lists what could not be installed, where the build logs are and how to retry.
     local file stage atom log_file
@@ -5376,7 +5385,11 @@ run_target_install() {
 
     if ((STOP_REQUESTED == 0)); then
         forget_passphrase
-        log "Full System is complete."
+        if installation_has_missing_packages; then
+            log "Installation pass finished with missing applications; repair them, then run continue."
+        else
+            log "Full System is complete."
+        fi
     fi
 }
 
