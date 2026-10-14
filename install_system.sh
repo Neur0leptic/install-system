@@ -519,8 +519,8 @@ state_initialize() {
     STATE[mode]="$MODE"
     STATE[tier]="$TIER"
     STATE[distribution]="$DISTRIBUTION"
+    STATE[desktop]="$DESKTOP"
     if [[ "$DISTRIBUTION" == arch ]]; then
-        STATE[desktop]="$DESKTOP"
         STATE[filesystem]="$FILESYSTEM"
         STATE[boot_method]="$BOOT_METHOD"
         STATE[repositories]="$REPOSITORIES"
@@ -4128,7 +4128,9 @@ public_dotfiles_source_valid() {
     # Later synchronized commits are valid. Only unpublished/local work is blocked.
     run_as_user git -C "$source" merge-base --is-ancestor HEAD "origin/$PUBLIC_DOTFILES_BRANCH" || return 1
     [[ -s "$source/.chezmoitemplates/machine-settings" && -s "$source/.chezmoidata/machinePresets.json" ]] &&
-        grep -q 'DWL_TAG_OUTPUT_' "$source/dot_config/dwl/patches/0001-neuroleptic.patch" &&
+        [[ -s "$source/.chezmoitemplates/dwl-config.h" &&
+           -s "$source/dot_config/dwl/config.def.h" ]] &&
+        grep -q 'DWL_CONFIG_VERSION' "$source/dot_config/dwl/config.def.h" &&
         [[ -s "$source/dot_config/shell/env.sh.tmpl" &&
            -s "$source/dot_local/bin/executable_setup_browser_theme.sh" &&
            -s "$source/dot_config/browser-extensions.json" &&
@@ -4158,12 +4160,70 @@ user_owned_tree_is_safe() {
     [[ -z "$unsafe" ]]
 }
 
+dwl_user_config() {
+    printf '%s' "/home/$USERNAME/.local/src/dwl/config.h"
+}
+
+validate_dwl_user_config() {
+    local config parent mode
+    config="$(dwl_user_config)" parent="$(dirname "$config")"
+    user_owned_directory_is_safe "$parent" &&
+        [[ -f "$config" && ! -L "$config" && -s "$config" &&
+           "$(stat -c %u "$config")" == "$(id -u "$USERNAME")" ]] || return 1
+    mode="$(stat -c %a "$config")" || return 1
+    (( (8#$mode & 8#022) == 0 )) &&
+        grep -qxF '#define DWL_CONFIG_VERSION 1' "$config"
+}
+
+prepare_dwl_user_config() {
+    local config parent source temporary data
+    config="$(dwl_user_config)" parent="$(dirname "$config")"
+    # config.h is the user's native input, not a generated resume artifact.
+    if [[ -e "$config" || -L "$config" ]]; then
+        validate_dwl_user_config || die "preserved DWL config needs review: $config; no file was overwritten"
+        return 0
+    fi
+    [[ ! -s /usr/share/dwl/neurogentoo/config.h ]] ||
+        die "existing packaged DWL settings need migration to $config first; the original config was preserved"
+    validate_display_config || die "initial DWL settings need approved display/input answers"
+    source="/home/$USERNAME/.local/share/chezmoi"
+    public_dotfiles_source_valid || die "public dotfiles lack the native DWL config defaults"
+    [[ "$(readlink -m -- "$parent")" == "$parent" ]] || die "DWL configuration parent contains a symlink: $parent"
+    run_as_user install -d -m 0755 "$parent"
+    user_owned_directory_is_safe "$parent" || die "unsafe DWL configuration directory: $parent"
+    data="$(jq -nc --arg machine "$MACHINE_PROFILE" --arg gpu "$GPU_PROFILE" \
+        --slurpfile settings "$(hardware_root)/displays.json" \
+        '{desktop:"dwl", machine:$machine, gpuProfile:$gpu, machineSettings:($settings[0]|tojson)}')" || return 1
+    temporary="$(run_as_user mktemp "$parent/.config.h.XXXXXX")" || return 1
+    if ! run_as_user env CHEZMOI_SKIP_EXTERNALS=1 chezmoi --source "$source" \
+        --override-data "$data" --output "$temporary" execute-template \
+        --file "$source/.chezmoitemplates/dwl-config.h"; then
+        run_as_user rm -f -- "$temporary"
+        die "initial DWL config could not be rendered; no config.h was installed"
+    fi
+    run_as_user chmod 0644 "$temporary"
+    # An atomic no-clobber handoff also protects an edit made during preparation.
+    if ! run_as_user ln -- "$temporary" "$config"; then
+        run_as_user rm -f -- "$temporary"
+        die "DWL config appeared during preparation; it was preserved: $config"
+    fi
+    run_as_user rm -f -- "$temporary"
+    validate_dwl_user_config || die "initial DWL config failed validation: $config"
+    log "DWL settings: $config; edit this file, then run update_dwl.sh. Continue preserves it."
+}
+
 phase_dwl_build() {
     if ! packaged_commands_are_unshadowed dwl yazi ya clipse timer ripdrag wayland-pipewire-idle-inhibit unimatrix; then
         request_wait "dwl-build needs local executable path conflicts resolved"
         return 0
     fi
     ensure_public_dotfiles_source
+    prepare_dwl_user_config
+    if ! dwl_savedconfig_policy_is_ready; then
+        request_wait "the selected DWL policy lacks savedconfig support; retain its policy_ref and complete the reviewed native-config migration before continuing"
+        return 0
+    fi
+    run_as_user sh "/home/$USERNAME/.local/share/chezmoi/dot_local/bin/executable_update_dwl.sh" --prepare-config
     local dotfiles_ref
     dotfiles_ref="$(public_dotfiles_revision)" || die "could not resolve the synchronized public dotfiles revision"
     if [[ "${FORCE_STAGE:-none}" == "$CURRENT_STAGE" ]] || ! validate_dwl_packaged_apps; then
@@ -4175,7 +4235,7 @@ phase_dwl_build() {
         # Runtime-only dotfile updates need no rebuild; changed compiled inputs do.
         EGIT_OVERRIDE_COMMIT_NEUR0LEPTIC_DOTFILES="$dotfiles_ref" \
             run_emerge --oneshot '=gui-wm/dwl-9999::neurogentoo'
-        validate_dwl_package_inputs || die "rebuilt DWL does not match the synchronized canonical patch/protocol"
+        validate_dwl_package_inputs || die "rebuilt DWL does not match config.h or the synchronized feature inputs"
     fi
     # start-dwl intentionally uses this existing user-local executable path.
     # The application itself is owned by Portage at /usr/bin/dwl.
@@ -4199,10 +4259,20 @@ validate_dwl_packaged_apps() {
         required_files check dwl-apps
 }
 
+dwl_savedconfig_policy_is_ready() {
+    # Older pinned installations may retain an explicit manual savedconfig repair.
+    local atoms
+    atoms="$(policy_package_atoms dwl-apps)" || return 1
+    grep -qxF 'gui-wm/dwl::neurogentoo[savedconfig]' <<<"$atoms" ||
+        portageq has_version / 'gui-wm/dwl::neurogentoo[savedconfig]'
+}
+
 validate_dwl_package_inputs() {
     local source="/home/$USERNAME/.local/share/chezmoi/dot_config/dwl"
     cmp -s "$source/patches/0001-neuroleptic.patch" /usr/share/dwl/neurogentoo/desktop.patch &&
-        cmp -s "$source/protocols/dwl-ipc-unstable-v2.xml" /usr/share/dwl/neurogentoo/dwl-ipc-unstable-v2.xml
+        cmp -s "$source/protocols/dwl-ipc-unstable-v2.xml" /usr/share/dwl/neurogentoo/dwl-ipc-unstable-v2.xml &&
+        validate_dwl_user_config &&
+        cmp -s "$(dwl_user_config)" /usr/share/dwl/neurogentoo/config.h
 }
 
 validate_dwl_build() {
@@ -4238,6 +4308,12 @@ phase_public_dotfiles() {
     local config="$home/.config/chezmoi/chezmoi.toml"
     yazi_mount_plugin="$home/.config/yazi/plugins/mount.yazi/sudo.lua"
     ensure_public_dotfiles_source
+
+    [[ "$DESKTOP" != dwl ]] || prepare_dwl_user_config
+    if ! TOLERATE_MISSING=1 validate_desktop_assets; then
+        request_wait "desktop cursor/sound inputs are unavailable; repair their selected packages first. Older pinned policy inputs remain unchanged"
+        return 0
+    fi
 
     if [[ -z "$GPG_RECIPIENT" ]]; then
         GPG_RECIPIENT="$(detect_gpg_recipient || true)"
@@ -4281,6 +4357,10 @@ PY
         --promptBool "Enable KeePass configuration=$FEATURE_KEEPASS" \
         --promptBool "Enable WireGuard integrations=$FEATURE_WIREGUARD" \
         --promptBool 'Enable Hermes integrations=false'
+    if ! desktop_theme_adoption_is_safe; then
+        request_wait "desktop theme inputs conflict with existing files; review them without discarding local edits, then continue"
+        return 0
+    fi
     run_as_user dbus-run-session -- \
         chezmoi --source "$source" --config "$config" --no-tty apply
     # Yazi's own package manager installs its plugins; without Yazi that waits for continue.
@@ -4292,6 +4372,53 @@ PY
             SSH_ASKPASS=/bin/false SSH_ASKPASS_REQUIRE=never \
             ya pkg install
     fi
+    [[ "$DISTRIBUTION" != gentoo ]] ||
+        missing_for_stage x11-themes/catppuccin-cursors x11-themes/sound-theme-freedesktop media-libs/libsndfile media-video/pipewire || true
+    if ! prepare_editor_theme; then
+        request_wait "Neovim's selected theme could not be initialized; its output above explains the failure. Repair it, then continue"
+    fi
+}
+
+desktop_theme_adoption_is_safe() {
+    local home="/home/$USERNAME" source="/home/$USERNAME/.local/share/chezmoi" file target state hash rendered
+    [[ "$DESKTOP" != none ]] || return 0
+    for file in .config/mako/config .config/nvim/lua/plugins/colorscheme.lua; do
+        target="$home/$file"
+        [[ "$(readlink -m -- "$target")" == "$target" ]] || { warn "unsafe theme input parent: $target"; return 1; }
+        [[ -e "$target" || -L "$target" ]] || continue
+        [[ -f "$target" && ! -L "$target" && "$(stat -c %u "$target")" == "$(id -u "$USERNAME")" &&
+           "$(readlink -m -- "$target")" == "$target" ]] || { warn "unsafe existing theme input: $target"; return 1; }
+        rendered="$(run_as_user chezmoi --source "$source" cat "$target" | sha256sum)" || return 1
+        hash="$(sha256sum "$target")" || return 1
+        [[ "${rendered%% *}" != "${hash%% *}" ]] || continue
+        # Chezmoi's recorded last write distinguishes a normal source update from
+        # first adoption or an independently edited destination; neither is forced.
+        state="$(run_as_user chezmoi state get --bucket entryState --key "$target")" || return 1
+        if jq -e --arg hash "${hash%% *}" '.type == "file" and .contentsSHA256 == $hash' <<<"$state" >/dev/null 2>&1; then
+            continue
+        fi
+        warn "existing desktop theme input differs and was preserved: $target"
+        return 1
+    done
+}
+
+prepare_editor_theme() {
+    [[ "$DESKTOP" != none ]] || return 0
+    [[ "$DISTRIBUTION" != gentoo ]] || ! missing_for_stage app-editors/neovim || return 0
+    validate_editor_theme && return 0
+    # Lazy's normal startup installs missing specs from its lockfile. Do not sync,
+    # update or clean an existing plugin tree as a side effect of theme deployment.
+    run_as_user env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+        timeout 300 nvim --headless \
+        '+lua if vim.g.colors_name ~= "fluoromachine" then vim.cmd("cquit 1") end' '+qa!' || return 1
+    validate_editor_theme
+}
+
+validate_editor_theme() {
+    [[ "$DESKTOP" != none ]] || return 0
+    [[ "$DISTRIBUTION" != gentoo ]] || ! tolerated app-editors/neovim || return 0
+    local plugin="/home/$USERNAME/.local/share/nvim/lazy/fluoromachine.nvim"
+    [[ -s "$plugin/lua/fluoromachine/init.lua" && -s "$plugin/colors/fluoromachine.lua" ]]
 }
 
 validate_public_preferences() {
@@ -4325,7 +4452,7 @@ validate_public_dotfiles() {
     source="$home/.local/share/chezmoi"
     public_dotfiles_source_valid && validate_public_preferences "$stage" &&
         [[ -s "$home/.config/chezmoi/chezmoi.toml" ]] &&
-        validate_desktop_dotfiles && validate_shell_theme_dotfiles &&
+        validate_desktop_dotfiles && validate_shell_theme_dotfiles && validate_desktop_assets && validate_editor_theme &&
         [[ -x "$home/.local/bin/waybar_toggle.sh" ]] &&
         [[ -x "$home/.local/bin/recorder.sh" ]] &&
         { tolerated app-misc/yazi || [[ -s "$home/.config/yazi/plugins/mount.yazi/sudo.lua" ]]; } &&
@@ -4343,6 +4470,7 @@ validate_shell_theme_dotfiles() {
     local home="/home/$USERNAME" source file rendered
     source="$home/.local/share/chezmoi"
     for file in .zshenv .config/shell/env.sh .config/zsh/.zprofile .config/zsh/.zshrc \
+        .config/mako/config .config/nvim/lua/plugins/colorscheme.lua \
         .config/foot/foot.ini .config/librewolf/chrome/userChrome.css .config/librewolf/chrome/userContent.css \
         .librewolf/librewolf.overrides.cfg .config/helium-browser-theme.json .config/browser-extensions.json \
         .local/bin/setup_librewolf.sh .local/bin/setup_browser_theme.sh \
@@ -4358,6 +4486,31 @@ validate_shell_theme_dotfiles() {
        -x "$home/.config/neurowave/apply.sh" ]] || return 1
     [[ "$(readlink "$home/.config/librewolf/librewolf/librewolf.overrides.cfg")" == "$home/.librewolf/librewolf.overrides.cfg" ]] || return 1
     diff -qr "$source/dot_config/neurowave/templates" "$home/.config/neurowave/templates" >/dev/null
+}
+
+validate_desktop_assets() {
+    local cursors=/usr/share/icons/catppuccin-mocha-sapphire-cursors
+    local sound=/usr/share/sounds/freedesktop/stereo/bell.oga file header
+    [[ "$DESKTOP" != none ]] || return 0
+    if [[ "$DISTRIBUTION" != gentoo ]] || ! tolerated x11-themes/catppuccin-cursors; then
+        [[ -s "$cursors/index.theme" ]] || return 1
+        for file in left_ptr hand2; do
+            [[ -s "$cursors/cursors/$file" ]] || return 1
+            header="$(od -An -tx1 -N4 -- "$cursors/cursors/$file" | tr -d '[:space:]')" || return 1
+            [[ "$header" == 58637572 ]] || return 1
+        done
+    fi
+    if [[ "$DISTRIBUTION" != gentoo ]] || ! tolerated x11-themes/sound-theme-freedesktop; then
+        [[ -s "$sound" ]] || return 1
+        header="$(od -An -tx1 -N4 -- "$sound" | tr -d '[:space:]')" || return 1
+        [[ "$header" == 4f676753 ]] || return 1
+    fi
+    if [[ "$DISTRIBUTION" == gentoo ]]; then
+        tolerated media-video/pipewire || [[ -x /usr/bin/pw-play ]] || return 1
+        tolerated media-libs/libsndfile || portageq has_version / 'media-libs/libsndfile[-minimal]' || return 1
+    else
+        [[ -x /usr/bin/pw-play ]] && pacman -Q libsndfile >/dev/null 2>&1 || return 1
+    fi
 }
 
 validate_librewolf_setup_outputs() {
@@ -4531,16 +4684,14 @@ validate_desktop_dotfiles() {
             cmp -s "$home/.config/hypr/machine.lua" <(run_as_user chezmoi --source "$source" cat "$home/.config/hypr/machine.lua")
         return
     fi
-    [[ -x "$home/.local/bin/start-dwl" && -x "$home/.local/bin/dwl-autostart" &&
-       -x "$home/.local/bin/dwl-outputs" && -s "$home/.config/dwl/outputs.json" &&
-       -s "$home/.config/swayidle/config-dwl" && -s "$home/.config/waybar/config-dwl.jsonc" &&
+    [[ -x "$home/.local/bin/start-dwl" && -x "$home/.local/bin/dwl-autostart" ]] &&
+        validate_dwl_user_config &&
+    [[ -s "$home/.config/swayidle/config-dwl" && -s "$home/.config/waybar/config-dwl.jsonc" &&
        -s "$home/.config/waybar/style-dwl.css" ]] &&
         cmp -s "$source/dot_local/bin/executable_dwl-autostart" "$home/.local/bin/dwl-autostart" &&
-        cmp -s "$source/dot_local/bin/executable_dwl-outputs" "$home/.local/bin/dwl-outputs" &&
         grep -qF 'config-dwl.jsonc' "$home/.local/bin/waybar_toggle.sh" &&
         cmp -s "$home/.local/bin/start-dwl" <(run_as_user chezmoi --source "$source" cat "$home/.local/bin/start-dwl") || return 1
-    python3 "$COMMON_DATA/displays.py" --inventory "$(hardware_root)/inventory.json" \
-        --input "$(hardware_root)/displays.json" --check-target "$home/.config/dwl/outputs.json"
+    # Machine answers seed config.h once; runtime files must not undo later edits.
 }
 
 private_apply_policy() {
@@ -5390,6 +5541,8 @@ run_target_install() {
         else
             log "Full System is complete."
         fi
+        [[ "$DESKTOP" != dwl || ! -s "$(dwl_user_config)" ]] ||
+            log "DWL settings: $(dwl_user_config); edit it, then run update_dwl.sh (--no-restart keeps the current session)."
     fi
 }
 
@@ -5953,7 +6106,9 @@ arch_local_packages() {
         chown "$USERNAME:$(id -gn "$USERNAME")" "$build/PKGBUILD"
         if [[ "$package" == dwl-neuroleptic ]]; then
             dotfiles_ref="$(public_dotfiles_revision)" || die "could not resolve the synchronized public dotfiles revision"
-            arch_user_command env "DWL_DOTFILES_REF=$dotfiles_ref" \
+            validate_dwl_user_config || die "DWL config.h needs review before building"
+            run_as_user cp -- "$(dwl_user_config)" "$build/config.h"
+            arch_user_command env "DWL_DOTFILES_REF=$dotfiles_ref" "DWL_CONFIG_FILE=$build/config.h" \
                 bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force' bash "$build"
         else
             arch_user_command bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force' bash "$build"
@@ -6573,12 +6728,13 @@ arch_desktop_packages() {
             return
         fi
         ensure_public_dotfiles_source
+        prepare_dwl_user_config
         if validate_dwl_package_inputs; then
             arch_local_packages desktop/dwl-local
         else
             FORCE_STAGE="$CURRENT_STAGE" arch_local_packages desktop/dwl-local
         fi
-        validate_dwl_package_inputs || die "DWL package inputs differ from the selected canonical patch/protocol"
+        validate_dwl_package_inputs || die "DWL package differs from config.h or the selected feature inputs"
         if [[ ! -e "$launcher" && ! -L "$launcher" ]]; then run_as_user ln -s /usr/bin/dwl "$launcher"; fi
     fi
     arch_services apply desktop
@@ -6687,6 +6843,8 @@ arch_run_target() {
     if ((STOP_REQUESTED == 0)); then
         forget_passphrase
         log "Arch full installation is complete ($DESKTOP)."
+        [[ "$DESKTOP" != dwl || ! -s "$(dwl_user_config)" ]] ||
+            log "DWL settings: $(dwl_user_config); edit it, then run update_dwl.sh (--no-restart keeps the current session)."
     fi
 }
 

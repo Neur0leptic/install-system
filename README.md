@@ -97,6 +97,12 @@ Available options:
 The installer asks for account, display and input preferences and saves the
 selected settings for reuse. Chezmoi manages the dotfiles; new accounts use Zsh.
 
+DWL keeps its editable settings in `~/.local/src/dwl/config.h` (Super+C opens it).
+The installer fills it once from the initial answers; continuing does not overwrite
+local edits. Edit that file, then run `update_dwl.sh` to rebuild through the native
+package manager. Use `--no-restart` to leave the current session running. The feature
+patch and protocol remain shared dotfiles, not another personal settings file.
+
 Prepared root and EFI partitions can be reused without formatting. Disk changes
 require confirmation. Choosing a tier approves all of its stages; switching an
 existing account to Zsh is confirmed at the start. New Gentoo installations use
