@@ -2603,7 +2603,7 @@ phase_display_config() {
         return 0
     fi
     temporary="$(mktemp "$root/.displays.XXXXXX")"
-    if ! python3 "$COMMON_DATA/displays.py" \
+    if ! python3 -B "$COMMON_DATA/displays.py" \
         --inventory "$root/inventory.json" "${args[@]}" >"$temporary"; then
         rm -f -- "$temporary"
         die "display configuration was not saved"
@@ -2619,9 +2619,9 @@ validate_display_config() {
     path="$(hardware_root)/displays.json"
     input="${DISPLAY_CONFIG:-$(hardware_root)/display-input.json}"
     [[ -f "$path" && ! -L "$path" ]] || return 1
-    [[ ! -f "$input" ]] || cmp -s "$path" <(python3 "$COMMON_DATA/displays.py" \
+    [[ ! -f "$input" ]] || cmp -s "$path" <(python3 -B "$COMMON_DATA/displays.py" \
         --inventory "$(hardware_root)/inventory.json" --input "$input") || return 1
-    python3 "$COMMON_DATA/displays.py" --inventory "$(hardware_root)/inventory.json" --input "$path" --check-hardware >/dev/null
+    python3 -B "$COMMON_DATA/displays.py" --inventory "$(hardware_root)/inventory.json" --input "$path" --check-hardware >/dev/null
 }
 
 portage_source_digest() (
@@ -4129,8 +4129,12 @@ public_dotfiles_source_valid() {
     run_as_user git -C "$source" merge-base --is-ancestor HEAD "origin/$PUBLIC_DOTFILES_BRANCH" || return 1
     [[ -s "$source/.chezmoitemplates/machine-settings" && -s "$source/.chezmoidata/machinePresets.json" ]] &&
         [[ -s "$source/.chezmoitemplates/dwl-config.h" &&
+           -s "$source/.chezmoitemplates/dwl-config-profile" &&
+           -s "$source/.chezmoitemplates/dwl-machine.h" &&
+           -s "$source/dot_local/src/dwl/config.h.tmpl" &&
            -s "$source/dot_config/dwl/config.def.h" ]] &&
         grep -q 'DWL_CONFIG_VERSION' "$source/dot_config/dwl/config.def.h" &&
+        grep -qF '/* machine settings: begin */' "$source/dot_config/dwl/config.def.h" &&
         [[ -s "$source/dot_config/shell/env.sh.tmpl" &&
            -s "$source/dot_local/bin/executable_setup_browser_theme.sh" &&
            -s "$source/dot_config/browser-extensions.json" &&
@@ -4191,13 +4195,14 @@ prepare_dwl_user_config() {
     [[ "$(readlink -m -- "$parent")" == "$parent" ]] || die "DWL configuration parent contains a symlink: $parent"
     run_as_user install -d -m 0755 "$parent"
     user_owned_directory_is_safe "$parent" || die "unsafe DWL configuration directory: $parent"
+    # The template takes this machine's saved sections if it has any, otherwise these answers.
     data="$(jq -nc --arg machine "$MACHINE_PROFILE" --arg gpu "$GPU_PROFILE" \
         --slurpfile settings "$(hardware_root)/displays.json" \
         '{desktop:"dwl", machine:$machine, gpuProfile:$gpu, machineSettings:($settings[0]|tojson)}')" || return 1
     temporary="$(run_as_user mktemp "$parent/.config.h.XXXXXX")" || return 1
     if ! run_as_user env CHEZMOI_SKIP_EXTERNALS=1 chezmoi --source "$source" \
         --override-data "$data" --output "$temporary" execute-template \
-        --file "$source/.chezmoitemplates/dwl-config.h"; then
+        --file "$source/dot_local/src/dwl/config.h.tmpl"; then
         run_as_user rm -f -- "$temporary"
         die "initial DWL config could not be rendered; no config.h was installed"
     fi
@@ -4361,7 +4366,9 @@ PY
         request_wait "desktop theme inputs conflict with existing files; review them without discarding local edits, then continue"
         return 0
     fi
-    run_as_user dbus-run-session -- \
+    # Normal sync owns header capture/restoration. Installer continue never applies
+    # a saved/default header over the user's current native build input.
+    run_as_user env CHEZMOI_PRESERVE_DWL_CONFIG=1 dbus-run-session -- \
         chezmoi --source "$source" --config "$config" --no-tty apply
     # Yazi's own package manager installs its plugins; without Yazi that waits for continue.
     if [[ ! -s "$yazi_mount_plugin" ]] && ! missing_for_stage app-misc/yazi; then
@@ -5383,7 +5390,7 @@ display_answers_before_account() {
     [[ "$USERNAME" != neuroleptic || "$PRIVATE_DOTFILES" == no ]] || args+=(--wireguard-profiles)
     [[ "$DESKTOP" != hyprland ]] || args+=(--desktop hyprland)
     temporary="$(mktemp "$root/.displays.XXXXXX")"
-    if ! python3 "$COMMON_DATA/displays.py" --inventory "$root/inventory.json" "${args[@]}" >"$temporary"; then
+    if ! python3 -B "$COMMON_DATA/displays.py" --inventory "$root/inventory.json" "${args[@]}" >"$temporary"; then
         rm -f -- "$temporary" "$presets"
         die "display configuration was not saved"
     fi
