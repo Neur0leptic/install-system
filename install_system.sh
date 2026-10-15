@@ -3639,6 +3639,19 @@ kernel_config_identity() {
         "$kernel_dir" "${config_sha%% *}" "${makefile_sha%% *}"
 }
 
+# Kernel options a manual Gentoo kernel needs for the desktop (USB host ports and the
+# internal Bluetooth card, browser gamepads) and for the WireGuard firewall and routing.
+readonly DESKTOP_KERNEL_OPTIONS="USB_PCI USB_EHCI_PCI USB_XHCI_PCI UHID INPUT_JOYDEV"
+readonly WIREGUARD_KERNEL_OPTIONS="WIREGUARD NETFILTER NF_CONNTRACK_MARK NF_TABLES NF_TABLES_INET NF_TABLES_IPV4 NF_TABLES_IPV6 NFT_CT NFT_NAT NFT_MASQ NFT_SOCKET NFT_FIB_INET SOCK_CGROUP_DATA IP_MULTIPLE_TABLES IPV6_MULTIPLE_TABLES"
+
+kernel_missing_options() { # OPTION...: those the manual kernel's .config neither builds in nor builds as modules
+    local config=/usr/src/linux/.config option
+    [[ "$DISTRIBUTION" == gentoo && "$KERNEL_CHOICE" != dist && -s "$config" ]] || return 0
+    for option in "$@"; do
+        grep -Eq "^CONFIG_${option}=[ym]$" "$config" || printf '%s ' "$option"
+    done
+}
+
 phase_kernel_config() {
     local kernel_dir identity waiting=/var/lib/install-system/kernel-config.waiting
     [[ "$KERNEL_CHOICE" != dist ]] || return 0
@@ -3672,6 +3685,13 @@ phase_kernel_config() {
     }
     printf '%s\n' "$identity" | write_file /var/lib/install-system/kernel-config.approved 0600
     rm -f -- "$waiting"
+    # Only the features this installation selected; a minimal system needs none of them.
+    local wanted="" missing
+    [[ "$TIER" == minimal ]] || wanted="$DESKTOP_KERNEL_OPTIONS"
+    [[ "$TIER" != full || "${STATE[wireguard]:-none}" == none ]] || wanted+=" $WIREGUARD_KERNEL_OPTIONS"
+    # shellcheck disable=SC2086
+    missing="$(kernel_missing_options $wanted)"
+    [[ -z "$missing" ]] || warn "the kernel config lacks options the selected features use: ${missing% }"
 }
 
 validate_kernel_config_stage() {
@@ -4934,6 +4954,11 @@ phase_wireguard() {
     local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard" identity
     local skipped=/var/lib/install-system/wireguard.skipped
     ! missing_for_stage net-vpn/wireguard-tools net-firewall/nftables || return 0
+    local missing
+    # shellcheck disable=SC2086
+    missing="$(kernel_missing_options $WIREGUARD_KERNEL_OPTIONS)"
+    [[ -z "$missing" ]] ||
+        die "the kernel lacks options WireGuard needs: ${missing% }; enable them in /usr/src/linux/.config, rebuild and install the kernel, then continue"
     [[ -x "$repo/bin/wireguard.sh" && -s "$repo/libexec/wireguard-dns.sh" ]] ||
         die "the WireGuard scripts are missing; repeat the full-public-dotfiles stage"
     install -d -m 0700 /etc/wireguard
