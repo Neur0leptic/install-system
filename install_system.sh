@@ -6110,7 +6110,7 @@ arch_check_lists() {
 }
 
 arch_user_command() {
-    # AUR builds keep a terminal for interactive makepkg/yay prompts.
+    # AUR builds answer their own prompts; the terminal stays for sudo and build output.
     local cpus memory jobs
     user_home_is_safe || die "unsafe target home"
     if ! run_as_user /bin/bash -c '[[ -r /etc/pacman.conf && -r /etc/resolv.conf ]]'; then
@@ -6140,7 +6140,7 @@ arch_install_lists() {
     ((${#native[@]} == 0)) || run_public pacman -S --noconfirm "${native[@]}"
     if ((${#aur[@]})); then
         command -v yay >/dev/null || die "packages require yay before this stage: ${aur[*]}"
-        arch_user_command yay -S "${aur[@]}"
+        arch_user_command yay -S --noconfirm --answerclean None --answerdiff None "${aur[@]}"
     fi
 }
 
@@ -6159,9 +6159,9 @@ arch_local_packages() {
             validate_dwl_user_config || die "DWL config.h needs review before building"
             run_as_user cp -- "$(dwl_user_config)" "$build/config.h"
             arch_user_command env "DWL_DOTFILES_REF=$dotfiles_ref" "DWL_CONFIG_FILE=$build/config.h" \
-                bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force' bash "$build"
+                bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force --noconfirm' bash "$build"
         else
-            arch_user_command bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force' bash "$build"
+            arch_user_command bash -c 'cd "$1" && makepkg --syncdeps --install --clean --force --noconfirm' bash "$build"
         fi
     done <<<"$packages"
 }
@@ -6620,7 +6620,7 @@ arch_yay() {
         run_as_user install -d -m 0755 "/home/$USERNAME/.cache/install-system"
         build="$(run_as_user mktemp -d "/home/$USERNAME/.cache/install-system/yay.XXXXXX")"
         run_as_user git clone "https://aur.archlinux.org/$helper.git" "$build"
-        arch_user_command bash -c 'cd "$1" && makepkg --syncdeps --install --clean' bash "$build"
+        arch_user_command bash -c 'cd "$1" && makepkg --syncdeps --install --clean --noconfirm' bash "$build"
     fi
 }
 
