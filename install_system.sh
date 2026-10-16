@@ -2092,6 +2092,13 @@ phase_chroot_mounts() {
     done
     if [[ "$DISTRIBUTION" == arch ]]; then
         mount_one_chroot_fs tmpfs /run "$TARGET_MOUNT/run"
+        # lsblk reads partition numbers, partition types and disk serials from the udev
+        # database; without it they come back empty. Share only that, read-only.
+        if [[ -d /run/udev ]]; then
+            install -d -m 0755 "$TARGET_MOUNT/run/udev"
+            mount_one_chroot_fs bind /run/udev "$TARGET_MOUNT/run/udev"
+            run mount -o remount,bind,ro "$TARGET_MOUNT/run/udev"
+        fi
     else
         mount_one_chroot_fs bind /run "$TARGET_MOUNT/run"
     fi
@@ -2125,7 +2132,10 @@ validate_chroot_mounts() {
     validate_chroot_devpts || return 1
     if [[ "$DISTRIBUTION" == arch ]]; then
         [[ "$(findmnt -rn -o FSTYPE -M "$TARGET_MOUNT/run")" == tmpfs &&
-           "$(stat -Lc '%d:%i' /run)" != "$(stat -Lc '%d:%i' "$TARGET_MOUNT/run")" ]]
+           "$(stat -Lc '%d:%i' /run)" != "$(stat -Lc '%d:%i' "$TARGET_MOUNT/run")" ]] || return 1
+        [[ ! -d /run/udev ]] ||
+            { [[ "$(stat -Lc '%d:%i' /run/udev)" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT/run/udev" 2>/dev/null)" ]] &&
+                findmnt -rn -o OPTIONS -M "$TARGET_MOUNT/run/udev" | grep -Eq '(^|,)ro(,|$)'; }
     else
         [[ "$(stat -Lc '%d:%i' /run)" == "$(stat -Lc '%d:%i' "$TARGET_MOUNT/run")" ]]
     fi
@@ -3759,15 +3769,16 @@ validate_kernel() {
         kernel_modules_installed "$(selected_kernel_directory)"
 }
 
-efi_entry_exists() {
-    local line line_lower expected_uuid="${STATE[boot_partuuid],,}"
+efi_entry_exists() { # 0: the entry exists, 1: it does not, 2: the firmware entries cannot be read
+    local output line line_lower expected_uuid="${STATE[boot_partuuid],,}"
     local expected_path='\efi\boot\bootx64.efi'
+    output="$(efibootmgr -v 2>/dev/null)" || return 2
     while IFS= read -r line; do
         line_lower="${line,,}"
         if [[ "$line_lower" == *gentoo* && "$line_lower" == *"$expected_uuid"* && "$line_lower" == *"$expected_path"* ]]; then
             return 0
         fi
-    done < <(efibootmgr -v 2>/dev/null || true)
+    done <<<"$output"
     return 1
 }
 
@@ -3814,7 +3825,10 @@ phase_boot() {
         partition_number="$(lsblk -nro PARTN "$BOOT_PARTITION")"
         [[ -n "$disk_name" && "$partition_number" =~ ^[0-9]+$ ]] || die "could not derive EFI disk metadata"
         parent_disk="/dev/$disk_name"
-        if ! efi_entry_exists; then
+        local entry=0
+        efi_entry_exists || entry=$?
+        ((entry != 2)) || die "cannot read the firmware boot entries (efibootmgr -v failed); is /sys/firmware/efi/efivars available?"
+        if ((entry == 1)); then
             run efibootmgr -c -d "$parent_disk" -p "$partition_number" -L Gentoo -l '\EFI\BOOT\BOOTX64.EFI'
         fi
     fi
@@ -4954,11 +4968,15 @@ phase_wireguard() {
     local home="/home/$USERNAME" repo="/home/$USERNAME/.local/share/wireguard" identity
     local skipped=/var/lib/install-system/wireguard.skipped
     ! missing_for_stage net-vpn/wireguard-tools net-firewall/nftables || return 0
-    local missing
-    # shellcheck disable=SC2086
-    missing="$(kernel_missing_options $WIREGUARD_KERNEL_OPTIONS)"
-    [[ -z "$missing" ]] ||
-        die "the kernel lacks options WireGuard needs: ${missing% }; enable them in /usr/src/linux/.config, rebuild and install the kernel, then continue"
+    # Check the kernel before a Mullvad device is registered, and only for a VPN in use.
+    if [[ -e /etc/wireguard/device.json || -e "$home/.config/wireguard/device.json" ||
+        "${STATE[wireguard]:-none}" != none ]]; then
+        local missing
+        # shellcheck disable=SC2086
+        missing="$(kernel_missing_options $WIREGUARD_KERNEL_OPTIONS)"
+        [[ -z "$missing" ]] ||
+            die "the kernel lacks options WireGuard needs: ${missing% }; enable them in /usr/src/linux/.config, rebuild and install the kernel, then continue"
+    fi
     [[ -x "$repo/bin/wireguard.sh" && -s "$repo/libexec/wireguard-dns.sh" ]] ||
         die "the WireGuard scripts are missing; repeat the full-public-dotfiles stage"
     install -d -m 0700 /etc/wireguard
@@ -6244,6 +6262,47 @@ arch_host_preflight() {
     lists="$(arch_base_lists)"
     mapfile -t selected <<<"$lists"
     arch_package_names "${selected[@]}" >/dev/null || die "Arch base package lists are incomplete"
+    arch_live_dns
+    arch_repository_check
+}
+
+arch_live_dns() {
+    # The installed system's resolver settings (Quad9 as resolved's global servers, next to
+    # the network's own) also serve the live ISO, so a failing router DNS cannot stop it.
+    # Only the ISO: an installation started from an installed Arch keeps that system's DNS.
+    local policy="$ARCH_DATA/system/minimal/etc/systemd/resolved.conf.d/install-system-dns.conf"
+    local live=/etc/systemd/resolved.conf.d/install-system-dns.conf
+    [[ -d /run/archiso && -s "$policy" ]] && systemctl is-active --quiet systemd-resolved || return 0
+    cmp -s "$policy" "$live" && return 0
+    install -D -m 0644 "$policy" "$live"
+    run systemctl restart systemd-resolved
+}
+
+arch_repository_check() {
+    # Download every bootstrap database into a scratch directory before the disk is touched.
+    local scratch repo host
+    local -a hosts=() unresolved=()
+    scratch="$(mktemp -d)" || die "cannot create a scratch directory"
+    install -d -m 0755 "$scratch/db/sync"
+    arch_pacman_config vanilla >"$scratch/pacman.conf"
+    if pacman --config "$scratch/pacman.conf" --dbpath "$scratch/db" --logfile "$scratch/pacman.log" \
+        --noconfirm -Sy >"$scratch/output" 2>&1; then
+        rm -rf -- "$scratch"
+        return 0
+    fi
+    cat "$scratch/output" >&2
+    while IFS= read -r repo; do
+        while IFS= read -r host; do
+            hosts+=("$host")
+        done < <(pacman-conf --config "$scratch/pacman.conf" --repo "$repo" Server | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
+    done < <(pacman-conf --config "$scratch/pacman.conf" --repo-list)
+    rm -rf -- "$scratch"
+    for host in $(printf '%s\n' "${hosts[@]}" | sort -u); do
+        getent ahosts "$host" >/dev/null || unresolved+=("$host")
+    done
+    ((${#unresolved[@]} == 0)) ||
+        die "DNS cannot resolve the package servers (${unresolved[*]}); the disk was not touched. Check the network connection and its DNS, then run the installer again"
+    die "the Arch package databases could not be downloaded (pacman's output is above); the disk was not touched. Check the network, then run the installer again"
 }
 
 arch_mount_root() {
@@ -6600,9 +6659,14 @@ EOF
 
 arch_first_snapshot_listed() {
     # The GRUB menu offers the first snapshot; one deleted later by hand is no longer expected.
-    [[ "${STATE[first_snapshot]:-}" =~ ^[0-9]+$ ]] &&
-        { [[ ! -d "/.snapshots/${STATE[first_snapshot]}/snapshot" ]] ||
-            grep -qsF "@snapshots/${STATE[first_snapshot]}/snapshot" /boot/grub/grub-btrfs.cfg; }
+    local snapshot="${STATE[first_snapshot]:-}" menu=/boot/grub/grub-btrfs.cfg
+    [[ "$snapshot" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "/.snapshots/$snapshot/snapshot" ]] || return 0
+    # Valid GRUB syntax, loaded by the main menu, and a kernel line that boots exactly this
+    # snapshot; the slash after the number keeps snapshot 1 from matching 12.
+    grub-script-check "$menu" && grub-script-check /boot/grub/grub.cfg &&
+        grep -qF 'grub-btrfs.cfg' /boot/grub/grub.cfg &&
+        grep -Eq "^[[:space:]]*linux[[:space:]]+\"?/@snapshots/${snapshot}/snapshot/" "$menu"
 }
 
 arch_validate_snapshots() {
@@ -6636,10 +6700,10 @@ arch_efi_loader() {
     else printf '%s' '\EFI\BOOT\BOOTX64.EFI'; fi
 }
 
-arch_efi_entry_exists() {
+arch_efi_entry_exists() { # 0: the entry exists, 1: it does not, 2: the firmware entries cannot be read
     local output loader line uuid="${STATE[boot_partuuid],,}"
     loader="$(arch_efi_loader)"
-    output="$(efibootmgr -v)" || return 1
+    output="$(efibootmgr -v)" || return 2
     while IFS= read -r line; do
         line="${line,,}"
         [[ "$line" != *arch* || "$line" != *"$uuid"* || "$line" != *"${loader,,}"* ]] || return 0
@@ -6666,11 +6730,16 @@ arch_boot() {
         # On Btrfs the snapshots stage takes the first snapshot once installation is done.
         run_public grub-mkconfig -o /boot/grub/grub.cfg
     fi
-    if [[ "$CREATE_EFI_ENTRY" == yes ]] && ! arch_efi_entry_exists; then
-        parent="$(lsblk -nro PKNAME "$BOOT_PARTITION")"
-        number="$(lsblk -nro PARTN "$BOOT_PARTITION")"
-        [[ -n "$parent" && "$number" =~ ^[0-9]+$ ]] || die "cannot resolve ESP disk/partition"
-        run efibootmgr -c -d "/dev/$parent" -p "$number" -L Arch -l "$(arch_efi_loader)"
+    if [[ "$CREATE_EFI_ENTRY" == yes ]]; then
+        local entry=0
+        arch_efi_entry_exists || entry=$?
+        ((entry != 2)) || die "cannot read the firmware boot entries (efibootmgr -v failed); is /sys/firmware/efi/efivars available?"
+        if ((entry == 1)); then
+            parent="$(lsblk -nro PKNAME "$BOOT_PARTITION")"
+            number="$(lsblk -nro PARTN "$BOOT_PARTITION")"
+            [[ -n "$parent" && "$number" =~ ^[0-9]+$ ]] || die "cannot resolve ESP disk/partition"
+            run efibootmgr -c -d "/dev/$parent" -p "$number" -L Arch -l "$(arch_efi_loader)"
+        fi
     fi
 }
 
