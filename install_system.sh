@@ -3597,15 +3597,26 @@ validate_accounts() {
         account_password_is_set root && account_password_is_set "$USERNAME"
 }
 
+network_policy_files() {
+    printf '%s\n' usr/local/sbin/udhcpc-all etc/udhcpc/default.script etc/init.d/udhcpc
+    # Policy snapshots with this file leave WiFi addresses to iwd; older ones run udhcpc
+    # on WiFi as well and have no iwd configuration.
+    [[ ! -f "$NEUROGENTOO_ROOT/config/system/network/etc/iwd/main.conf" ]] || printf '%s\n' etc/iwd/main.conf
+}
+
 phase_network() {
+    local -a files=()
+    mapfile -t files < <(network_policy_files)
     system_policy apply minimal etc/resolv.conf
-    system_policy apply network usr/local/sbin/udhcpc-all etc/udhcpc/default.script etc/init.d/udhcpc
+    system_policy apply network "${files[@]}"
     system_policy_services apply network
 }
 
 validate_network() {
+    local -a files=()
+    mapfile -t files < <(network_policy_files)
     system_policy check minimal etc/resolv.conf &&
-        system_policy check network usr/local/sbin/udhcpc-all etc/udhcpc/default.script etc/init.d/udhcpc &&
+        system_policy check network "${files[@]}" &&
         sh -n /usr/local/sbin/udhcpc-all && sh -n /etc/udhcpc/default.script &&
         busybox --list | grep -x udhcpc >/dev/null &&
         system_policy_services check network
