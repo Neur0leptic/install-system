@@ -5034,6 +5034,8 @@ phase_wireguard() {
     if [[ "$DISTRIBUTION" == arch ]]; then
         install -m 0644 "$repo/init/systemd/wireguard-autoconnect.service" /etc/systemd/system/wireguard-autoconnect.service
         run_public systemctl --root=/ enable wireguard-autoconnect.service
+        [[ ! -f /usr/lib/systemd/system/searxng.service ]] ||
+            searxng_outside_vpn | arch_managed_file /etc/systemd/system/searxng.service.d/install-system-wireguard.conf
     else
         install -m 0755 "$repo/init/openrc/wireguard-autoconnect" /etc/init.d/wireguard-autoconnect
         run rc-update add wireguard-autoconnect default
@@ -5114,11 +5116,20 @@ validate_wireguard() {
     [[ -e /etc/wireguard/device.json && -x /usr/local/bin/wireguard.sh && -x /usr/local/bin/wireguard-dns.sh ]] ||
         return 1
     if [[ "$DISTRIBUTION" == arch ]]; then
-        systemctl --root=/ is-enabled --quiet wireguard-autoconnect.service
+        systemctl --root=/ is-enabled --quiet wireguard-autoconnect.service &&
+            { [[ ! -f /usr/lib/systemd/system/searxng.service ]] ||
+                cmp -s /etc/systemd/system/searxng.service.d/install-system-wireguard.conf <(searxng_outside_vpn); }
     else
         services="$(rc-update show default)" || return 1
         [[ " $(awk '{print $1}' <<<"$services" | tr '\n' ' ') " == *" wireguard-autoconnect "* ]]
     fi
+}
+
+searxng_outside_vpn() {
+    # Search engines block Mullvad's addresses, so SearXNG searches outside the VPN. The VPN
+    # script needs root to move it there; setpriv then drops to SearXNG's own user.
+    printf '%s\n' '[Service]' 'User=root' 'Group=root' 'ExecStart=' \
+        'ExecStart=/usr/local/bin/wireguard.sh exclude /usr/bin/setpriv --reuid=searxng --regid=searxng --init-groups /usr/bin/searxng-run'
 }
 
 validate_dwl_complete() {
@@ -6889,12 +6900,38 @@ arch_uv_tools() {
     done <<<"$entries"
 }
 
+arch_searxng_settings() { # apply|check: the author's SearXNG settings with this computer's own key
+    local action="$1" template="$ARCH_DATA/searxng/settings.yml" settings=/etc/searxng/settings.yml
+    local receipt=/var/lib/install-system/arch-managed/etc/searxng/settings.yml.sha256 contents key="" hash
+    # Older neuroarch snapshots have no template; SearXNG then keeps the package's settings.
+    [[ -s "$template" ]] || return 0
+    contents="$(<"$template")"
+    if [[ -f "$settings" && ! -L "$settings" && -s "$receipt" ]]; then
+        hash="$(sha256sum "$settings")"
+        # The file written earlier keeps its key, so a repeated run changes nothing.
+        [[ "${hash%% *}" != "$(<"$receipt")" ]] ||
+            key="$(sed -n 's/^    secret_key: "\([0-9a-f]\{64\}\)"$/\1/p' "$settings")"
+    fi
+    if [[ "$action" == check ]]; then
+        [[ -n "$key" ]] && cmp -s "$settings" <(printf '%s\n' "${contents//@SECRET_KEY@/$key}") &&
+            [[ "$(stat -c '%U:%G %a' "$settings")" == 'root:searxng 640' ]]
+        return
+    fi
+    getent group searxng >/dev/null || die "SearXNG's group is missing; its package did not install"
+    # A new key, not the package's: the package's file stays beside it, readable by everyone.
+    [[ -n "$key" ]] || key="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ "$key" =~ ^[0-9a-f]{64}$ ]] || die "could not create SearXNG's secret key"
+    printf '%s\n' "${contents//@SECRET_KEY@/$key}" | arch_managed_file "$settings" 0640
+    chgrp searxng "$settings"
+}
+
 arch_full_packages() {
     arch_install_lists full
     [[ "$TORRENT" != yes ]] || arch_install_lists torrent
     arch_local_packages full-local
     arch_uv_tools install
     arch_system_layer apply full
+    arch_searxng_settings apply
     arch_services apply full
     if arch_grub_theme_selected; then
         arch_install_lists boot/grub-theme
@@ -6906,7 +6943,7 @@ arch_full_packages() {
 
 arch_validate_full() {
     arch_check_lists full full-local && arch_local_outputs full-local && arch_uv_tools check &&
-        arch_system_layer check full && arch_services check full &&
+        arch_system_layer check full && arch_searxng_settings check && arch_services check full &&
         { [[ "$TORRENT" != yes ]] || arch_check_lists torrent; } &&
         { ! arch_grub_theme_selected ||
             { arch_check_lists boot/grub-theme && arch_system_layer check grub-theme && arch_grub_theme_listed; }; }
