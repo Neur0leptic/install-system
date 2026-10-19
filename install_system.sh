@@ -44,6 +44,7 @@ readonly PRIVATE_APPLY_POLICY="selected-private-with-transmission-v2"
 # Published at https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
 readonly GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 readonly SSH_CLIENT_POLICY="etc/ssh/ssh_config.d/00-install-system.conf"
+readonly POLKIT_RULES_POLICY="etc/polkit-1/rules.d/00-install-system.rules"
 readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
 # Gentoo packages that later stages or the DWL session cannot do without: when one cannot
 # be installed, the installation stops. Other packages that fail are skipped and listed
@@ -4052,6 +4053,16 @@ phase_desktop_packages() {
 
     [[ -f /etc/pam.d/system-login ]] || die "system-login PAM configuration is missing"
     system_policy apply dwl etc/pam.d/system-login
+    # Without elogind polkit sees no active session, so udisks would ask for the root
+    # password; the rule gives the user what an active session gets. polkit comes with
+    # udisks: when udisks could not be installed, continue adds the rule later.
+    if dwl_has_polkit_rule; then
+        if [[ -d /etc/polkit-1/rules.d ]]; then
+            system_policy apply dwl "$POLKIT_RULES_POLICY"
+        elif ((PHASE_INCOMPLETE == 0)) || ! layer_incomplete dwl || portageq has_version / sys-auth/polkit; then
+            die "polkit rules directory is missing"
+        fi
+    fi
     ssh_client_reads_rsa || system_policy apply dwl "$SSH_CLIENT_POLICY"
 }
 
@@ -4061,6 +4072,11 @@ ssh_client_reads_rsa() {
     local types
     types="$(ssh -Q key 2>/dev/null)" || return 1
     grep -qx ssh-rsa <<<"$types"
+}
+
+dwl_has_polkit_rule() {
+    # Policy snapshots older than the rule have no such file.
+    [[ -f "$NEUROGENTOO_ROOT/config/system/dwl/$POLKIT_RULES_POLICY" ]]
 }
 
 validate_desktop_packages() {
@@ -4077,6 +4093,9 @@ validate_desktop_packages() {
                 ! portageq has_version / "acct-group/$group"; } || return 1
     done
     system_policy_services check dwl && system_policy check dwl etc/pam.d/system-login &&
+        { ! dwl_has_polkit_rule ||
+            { [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete dwl && [[ ! -d /etc/polkit-1/rules.d ]] &&
+                ! portageq has_version / sys-auth/polkit; } || system_policy check dwl "$POLKIT_RULES_POLICY"; } &&
         { ssh_client_reads_rsa || system_policy check dwl "$SSH_CLIENT_POLICY"; }
 }
 
