@@ -4430,12 +4430,6 @@ PY
         request_wait "desktop theme inputs conflict with existing files; review them without discarding local edits, then continue"
         return 0
     fi
-    # An interactive Neovim start updates plugins (the dotfiles' VimEnter autocommand) and
-    # rewrites lazy-lock.json; during installation the dotfiles' copy wins.
-    if [[ -e "/home/$USERNAME/.config/nvim/lazy-lock.json" ]]; then
-        run_as_user chezmoi --source "$source" --config "$config" --no-tty apply --force \
-            "/home/$USERNAME/.config/nvim/lazy-lock.json"
-    fi
     # Normal sync owns header capture/restoration. Installer continue never applies
     # a saved/default header over the user's current native build input.
     run_as_user env CHEZMOI_PRESERVE_DWL_CONFIG=1 dbus-run-session -- \
@@ -4483,8 +4477,8 @@ prepare_editor_theme() {
     [[ "$DESKTOP" != none ]] || return 0
     [[ "$DISTRIBUTION" != gentoo ]] || ! missing_for_stage app-editors/neovim || return 0
     validate_editor_theme && return 0
-    # Lazy's normal startup installs missing specs from its lockfile. Do not sync,
-    # update or clean an existing plugin tree as a side effect of theme deployment.
+    # Lazy's normal startup installs missing plugins. Do not sync, update or clean an
+    # existing plugin tree as a side effect of theme deployment.
     run_as_user env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
         timeout 300 nvim --headless \
         '+lua if vim.g.colors_name ~= "fluoromachine" then vim.cmd("cquit 1") end' '+qa!' || return 1
