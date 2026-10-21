@@ -46,6 +46,7 @@ readonly GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOM
 readonly SSH_CLIENT_POLICY="etc/ssh/ssh_config.d/00-install-system.conf"
 readonly POLKIT_RULES_POLICY="etc/polkit-1/rules.d/00-install-system.rules"
 readonly -a BATTERY_POLICY=(etc/udev/rules.d/90-install-system-battery.rules usr/local/sbin/battery-event)
+readonly -a LID_POLICY=(etc/conf.d/acpid etc/acpi/lid.d/lid usr/local/sbin/lid-event)
 readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
 # Gentoo packages that later stages or the DWL session cannot do without: when one cannot
 # be installed, the installation stops. Other packages that fail are skipped and listed
@@ -3441,8 +3442,8 @@ system_policy_services() {
     while read -r service runlevel extra; do
         [[ -n "$service" && "$service" != \#* ]] || continue
         [[ "$service" =~ ^[a-zA-Z0-9_.-]+$ && "$runlevel" =~ ^[a-zA-Z0-9_-]+$ && -z "$extra" ]] || return 1
-        # iwd would fight another network manager for the wireless device, and the
-        # Bluetooth service has nothing to do without an adapter.
+        # iwd would fight another network manager for the wireless device; the Bluetooth
+        # service has nothing to do without an adapter, nor acpid without a lid.
         if [[ "$service" == iwd && -n "$(rc-update show 2>/dev/null |
             awk '$1 ~ /^(NetworkManager|wpa_supplicant|connman|connmand)$/ {print $1}')" ]]; then
             [[ "$action" != apply ]] || log "Leaving iwd off: another network manager is enabled"
@@ -3450,6 +3451,10 @@ system_policy_services() {
         fi
         if [[ "$service" == bluetooth ]] && ! compgen -G '/sys/class/bluetooth/hci*' >/dev/null; then
             [[ "$action" != apply ]] || log "Leaving bluetooth off: this computer has no Bluetooth adapter"
+            continue
+        fi
+        if [[ "$service" == acpid ]] && ! compgen -G '/proc/acpi/button/lid/*' >/dev/null; then
+            [[ "$action" != apply ]] || log "Leaving acpid off: this computer has no lid"
             continue
         fi
         # A service whose package could not be installed waits until continue retries it.
@@ -4068,7 +4073,28 @@ phase_desktop_packages() {
     if dwl_has_battery_policy; then
         system_policy apply dwl "${BATTERY_POLICY[@]}"
     fi
+    # Closing the lid locks the session and suspends. acpid's conf.d file comes with the
+    # package, and its unedited copy is the base that later runs compare with. When acpid
+    # could not be installed, continue adds the files later.
+    if dwl_has_lid_policy; then
+        if [[ -f /etc/conf.d/acpid ]]; then
+            if package_file_unchanged sys-power/acpid /etc/conf.d/acpid; then
+                system_policy seed dwl etc/conf.d/acpid
+            fi
+            system_policy apply dwl "${LID_POLICY[@]}"
+        elif ((PHASE_INCOMPLETE == 0)) || ! layer_incomplete dwl || portageq has_version / sys-power/acpid; then
+            die "acpid configuration is missing"
+        fi
+    fi
     ssh_client_reads_rsa || system_policy apply dwl "$SSH_CLIENT_POLICY"
+}
+
+package_file_unchanged() { # PACKAGE PATH: true when PATH equals the copy the package installed
+    local cpv recorded
+    cpv="$(portageq match / "$1" | tail -n 1)"
+    [[ -n "$cpv" ]] || return 1
+    recorded="$(awk -v path="$2" '$1 == "obj" && $2 == path {print $3}' "/var/db/pkg/$cpv/CONTENTS")"
+    [[ -n "$recorded" && "$(md5sum <"$2")" == "$recorded  -" ]]
 }
 
 ssh_client_reads_rsa() {
@@ -4089,6 +4115,11 @@ dwl_has_battery_policy() {
     [[ -f "$NEUROGENTOO_ROOT/config/system/dwl/${BATTERY_POLICY[0]}" ]]
 }
 
+dwl_has_lid_policy() {
+    # Policy snapshots older than the lid handler have no such files.
+    [[ -f "$NEUROGENTOO_ROOT/config/system/dwl/${LID_POLICY[2]}" ]]
+}
+
 validate_desktop_packages() {
     local -a POLICY_LAYERS=()
     selected_policy_layers dwl
@@ -4107,6 +4138,9 @@ validate_desktop_packages() {
             { [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete dwl && [[ ! -d /etc/polkit-1/rules.d ]] &&
                 ! portageq has_version / sys-auth/polkit; } || system_policy check dwl "$POLKIT_RULES_POLICY"; } &&
         { ! dwl_has_battery_policy || system_policy check dwl "${BATTERY_POLICY[@]}"; } &&
+        { ! dwl_has_lid_policy ||
+            { [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete dwl && [[ ! -f /etc/conf.d/acpid ]] &&
+                ! portageq has_version / sys-power/acpid; } || system_policy check dwl "${LID_POLICY[@]}"; } &&
         { ssh_client_reads_rsa || system_policy check dwl "$SSH_CLIENT_POLICY"; }
 }
 
