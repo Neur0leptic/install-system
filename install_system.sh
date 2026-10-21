@@ -45,6 +45,7 @@ readonly PRIVATE_APPLY_POLICY="selected-private-with-transmission-v2"
 readonly GITHUB_SSH_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 readonly SSH_CLIENT_POLICY="etc/ssh/ssh_config.d/00-install-system.conf"
 readonly POLKIT_RULES_POLICY="etc/polkit-1/rules.d/00-install-system.rules"
+readonly -a BATTERY_POLICY=(etc/udev/rules.d/90-install-system-battery.rules usr/local/sbin/battery-event)
 readonly LIBREWOLF_REPOSITORY_URL="https://codeberg.org/librewolf/gentoo.git"
 # Gentoo packages that later stages or the DWL session cannot do without: when one cannot
 # be installed, the installation stops. Other packages that fail are skipped and listed
@@ -4063,6 +4064,10 @@ phase_desktop_packages() {
             die "polkit rules directory is missing"
         fi
     fi
+    # Battery warnings and the low-battery power-off; without a battery the rule never runs.
+    if dwl_has_battery_policy; then
+        system_policy apply dwl "${BATTERY_POLICY[@]}"
+    fi
     ssh_client_reads_rsa || system_policy apply dwl "$SSH_CLIENT_POLICY"
 }
 
@@ -4077,6 +4082,11 @@ ssh_client_reads_rsa() {
 dwl_has_polkit_rule() {
     # Policy snapshots older than the rule have no such file.
     [[ -f "$NEUROGENTOO_ROOT/config/system/dwl/$POLKIT_RULES_POLICY" ]]
+}
+
+dwl_has_battery_policy() {
+    # Policy snapshots older than the battery handler have no such files.
+    [[ -f "$NEUROGENTOO_ROOT/config/system/dwl/${BATTERY_POLICY[0]}" ]]
 }
 
 validate_desktop_packages() {
@@ -4096,6 +4106,7 @@ validate_desktop_packages() {
         { ! dwl_has_polkit_rule ||
             { [[ "${TOLERATE_MISSING:-0}" == 1 ]] && layer_incomplete dwl && [[ ! -d /etc/polkit-1/rules.d ]] &&
                 ! portageq has_version / sys-auth/polkit; } || system_policy check dwl "$POLKIT_RULES_POLICY"; } &&
+        { ! dwl_has_battery_policy || system_policy check dwl "${BATTERY_POLICY[@]}"; } &&
         { ssh_client_reads_rsa || system_policy check dwl "$SSH_CLIENT_POLICY"; }
 }
 
