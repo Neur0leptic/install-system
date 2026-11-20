@@ -4247,7 +4247,8 @@ public_dotfiles_source_valid() {
         [[ -s "$source/dot_config/shell/env.sh.tmpl" &&
            -s "$source/dot_local/bin/executable_setup_browser_theme.sh" &&
            -s "$source/dot_config/browser-extensions.json" &&
-           ( -s "$source/private_dot_librewolf/librewolf.overrides.cfg" ||
+           ( -s "$source/dot_config/librewolf/private_librewolf/librewolf.overrides.cfg" ||
+             -s "$source/private_dot_librewolf/librewolf.overrides.cfg" ||
              -s "$source/dot_librewolf/librewolf.overrides.cfg" ) ]]
 }
 
@@ -4583,12 +4584,15 @@ validate_public_dotfiles() {
 }
 
 validate_shell_theme_dotfiles() {
-    local home="/home/$USERNAME" source file rendered
+    local home="/home/$USERNAME" source file rendered overrides=.config/librewolf/librewolf/librewolf.overrides.cfg
     source="$home/.local/share/chezmoi"
+    # Older dotfiles keep the overrides in ~/.librewolf and link them from LibreWolf's XDG directory.
+    [[ -s "$source/dot_config/librewolf/private_librewolf/librewolf.overrides.cfg" ]] ||
+        overrides=.librewolf/librewolf.overrides.cfg
     for file in .zshenv .config/shell/env.sh .config/zsh/.zprofile .config/zsh/.zshrc \
         .config/mako/config .config/nvim/lua/plugins/colorscheme.lua \
         .config/foot/foot.ini .config/librewolf/chrome/userChrome.css .config/librewolf/chrome/userContent.css \
-        .librewolf/librewolf.overrides.cfg .config/helium-browser-theme.json .config/browser-extensions.json \
+        "$overrides" .config/helium-browser-theme.json .config/browser-extensions.json \
         .local/bin/setup_librewolf.sh .local/bin/setup_browser_theme.sh \
         .local/share/themes/Neurowave/index.theme .local/share/themes/Neurowave/gtk-3.0/gtk.css \
         .local/share/themes/Neurowave/gtk-4.0/gtk.css .local/share/Kvantum/Neurowave/Neurowave.kvconfig \
@@ -4600,7 +4604,8 @@ validate_shell_theme_dotfiles() {
     done
     [[ -x "$home/.local/bin/setup_librewolf.sh" && -x "$home/.local/bin/setup_browser_theme.sh" &&
        -x "$home/.config/neurowave/apply.sh" ]] || return 1
-    [[ "$(readlink "$home/.config/librewolf/librewolf/librewolf.overrides.cfg")" == "$home/.librewolf/librewolf.overrides.cfg" ]] || return 1
+    [[ "$overrides" != .librewolf/* ||
+       "$(readlink "$home/.config/librewolf/librewolf/librewolf.overrides.cfg")" == "$home/.librewolf/librewolf.overrides.cfg" ]] || return 1
     diff -qr "$source/dot_config/neurowave/templates" "$home/.config/neurowave/templates" >/dev/null
 }
 
@@ -4641,20 +4646,22 @@ validate_librewolf_setup_outputs() {
 }
 
 librewolf_profile() { # check|create
-    # As the target user. "check" succeeds when the profile that the unchanged setup script
-    # reads from ~/.librewolf/profiles.ini is the one the browser-theme helper accepts as
+    # As the target user. "check" succeeds when the profile that the setup script reads
+    # from LibreWolf's profiles.ini is the one the browser-theme helper accepts as
     # LibreWolf's only default profile, safe to use; the stage checks the result with that
     # helper, so the script must not change any other profile. "create" starts LibreWolf
     # headless until that is true, at most 30 seconds, and stops it again.
-    # LibreWolf now puts new profiles under ~/.config/librewolf/librewolf unless
-    # ~/.librewolf already has one; MOZ_LEGACY_HOME=1 keeps them in ~/.librewolf.
-    run_as_user env MOZ_LEGACY_HOME=1 /bin/bash -c '
+    # LibreWolf keeps an existing ~/.librewolf/profiles.ini; otherwise its profiles live
+    # under ~/.config/librewolf/librewolf, where a first start creates them.
+    run_as_user /bin/bash -c '
+        root="${XDG_CONFIG_HOME:-$HOME/.config}/librewolf/librewolf"
+        [[ ! -e "$HOME/.librewolf/profiles.ini" ]] || root="$HOME/.librewolf"
         ready() {
             local profile chosen
-            profile="$(sed -n "/^\[Install/,/^\[/{/^Default=/{s/^Default=//p;q}}" "$HOME/.librewolf/profiles.ini" 2>/dev/null)" &&
+            profile="$(sed -n "/^\[Install/,/^\[/{/^Default=/{s/^Default=//p;q}}" "$root/profiles.ini" 2>/dev/null)" &&
                 [[ -n "$profile" ]] &&
                 chosen="$("$HOME/.local/bin/setup_browser_theme.sh" --librewolf-profile 2>/dev/null)" &&
-                [[ "$(readlink -m -- "$HOME/.librewolf/$profile")" == "$chosen" ]]
+                [[ "$(readlink -m -- "$root/$profile")" == "$chosen" ]]
         }
         [[ "$1" == create ]] || { ready; exit; }
         librewolf --headless --no-remote &
@@ -4675,8 +4682,7 @@ librewolf_profile() { # check|create
 }
 
 phase_librewolf_setup() {
-    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" home="/home/$USERNAME" result answer output root
-    local -a xdg_profiles=()
+    local script="/home/$USERNAME/.local/bin/setup_librewolf.sh" home="/home/$USERNAME" result answer output
     ! missing_for_stage www-client/librewolf || return 0
     [[ -x "$script" ]] || die "managed LibreWolf setup script is missing"
     [[ -x "$home/.local/bin/setup_browser_theme.sh" ]] || die "managed browser-theme helper is missing"
@@ -4692,26 +4698,17 @@ phase_librewolf_setup() {
         request_wait "LibreWolf setup failed previously; complete it as $USERNAME (for example by rerunning $script) and confirm on resume, or select librewolf-setup to retry it"
         return 0
     fi
-    # The unchanged script needs a profile in ~/.librewolf; a first start creates it there.
+    # The setup script needs LibreWolf's default profile; a first start creates it.
     if ! librewolf_profile check; then
-        if [[ -e "$home/.librewolf/profiles.ini" || -L "$home/.librewolf/profiles.ini" ]]; then
-            # LibreWolf already keeps its profiles there, so another start would not help.
+        if [[ -e "$home/.librewolf/profiles.ini" || -L "$home/.librewolf/profiles.ini" ||
+              -e "$home/.config/librewolf/librewolf/profiles.ini" || -L "$home/.config/librewolf/librewolf/profiles.ini" ]]; then
+            # LibreWolf already has its profile list, so another start would not help.
             run_as_user "$home/.local/bin/setup_browser_theme.sh" --librewolf-profile >/dev/null || true
-            request_wait "$USERNAME's ~/.librewolf/profiles.ini does not name one safe default profile that the unchanged setup script can use; repair it, then continue"
-            return 0
-        fi
-        for root in "$home/.config/librewolf/librewolf" "$home/.config/librewolf"; do
-            [[ ! -e "$root/profiles.ini" ]] || xdg_profiles+=("${root#"$home/"}")
-        done
-        if ((${#xdg_profiles[@]} && INTERNAL_CHROOT == 0)); then
-            # On a running system that profile may hold the account's data, and LibreWolf
-            # would switch to a new, empty profile in ~/.librewolf.
-            state_set librewolf_setup_result failed
-            request_wait "LibreWolf keeps $USERNAME's existing profile in ~/${xdg_profiles[0]}, which the unchanged setup script does not use; apply Arkenfox to that profile yourself, then continue and confirm it"
+            request_wait "$USERNAME's LibreWolf profiles.ini does not name one safe default profile that the setup script can use; repair it, then continue"
             return 0
         fi
         run_as_user /bin/bash -c 'command -v librewolf' >/dev/null || die "LibreWolf is not installed"
-        log "Starting LibreWolf once as $USERNAME to create its profile in ~/.librewolf."
+        log "Starting LibreWolf once as $USERNAME to create its profile."
         output="$(mktemp)"
         if ! librewolf_profile create >"$output" 2>&1; then
             warn "LibreWolf did not create a profile within 30 seconds. Its output:"
@@ -4721,15 +4718,11 @@ phase_librewolf_setup() {
             return 0
         fi
         rm -f -- "$output"
-        # In the installer's chroot the system is not running, so such a profile comes
-        # from an earlier setup attempt. It stays on disk as it is.
-        ((${#xdg_profiles[@]} == 0)) ||
-            log "LibreWolf now uses ~/.librewolf; the profile an earlier attempt left in ~/${xdg_profiles[0]} stays unused."
     fi
     # Interruptions and explicit retries must not retain a previous success result.
     state_set librewolf_setup_result failed
-    log "Calling the unchanged LibreWolf/Arkenfox setup script as $USERNAME."
-    if run_as_user env MOZ_LEGACY_HOME=1 "$script"; then
+    log "Calling the LibreWolf/Arkenfox setup script as $USERNAME."
+    if run_as_user "$script"; then
         if validate_librewolf_setup_outputs; then
             state_set librewolf_setup_result success
             log "LibreWolf setup: SUCCESS (exit status 0)."
@@ -4741,7 +4734,7 @@ phase_librewolf_setup() {
         warn "LibreWolf setup: FAILED (exit status $result)."
     fi
     state_set librewolf_setup_result failed
-    request_wait "LibreWolf setup did not complete; its script is unchanged and can be rerun manually as $USERNAME"
+    request_wait "LibreWolf setup did not complete; its script can be rerun manually as $USERNAME"
 }
 
 validate_librewolf_setup() {
