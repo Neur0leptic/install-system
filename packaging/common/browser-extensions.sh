@@ -58,8 +58,11 @@ configure_browser_extension_policies() (
     local mode="$1" manifest="$2" defaults="$3" wolf_path="$4" helium_directory="$5"
     local config wolf_base wolf_existing='{"policies":{}}' wolf_desired helium_desired
     local helium_path="$helium_directory/install-system-browser-extensions.json" helium_base='{}' path count=0
-    local wolf_before helium_before id url update_manifest update_data temporary="" wolf_output helium_output
-    trap 'if [[ -n "$temporary" ]]; then rm -f -- "$temporary"; fi' EXIT
+    local wolf_before helium_before id url wolf_current wolf_output helium_output
+    # GitFlic keeps only the newest Bypass Paywalls Clean release, so a versioned
+    # download link stops working with the next release. The add-on's README links this
+    # stable file, and the installed add-on updates itself from its own update manifest.
+    local bpc_latest='https://gitflic.ru/project/magnolia1234/bpc_uploads/blob/raw?file=bypass_paywalls_clean-latest.xpi'
 
     browser_extension_policy_file_is_safe "$manifest" || exit 1
     browser_extension_policy_file_is_safe "$defaults" || exit 1
@@ -125,27 +128,24 @@ configure_browser_extension_policies() (
     if [[ -e "$helium_path" ]]; then helium_base="$(jq -e 'select(type == "object")' "$helium_path")"; fi
     helium_before="$(browser_extension_policy_fingerprint "$helium_path")"
 
-    while IFS=$'\t' read -r id update_manifest; do
+    # The merge starts from the existing policy; a versioned link from an earlier run is
+    # replaced there, while check still compares against the unchanged file.
+    wolf_current="$wolf_existing"
+    while IFS= read -r id; do
         [[ -n "$id" ]] || continue
-        url="$(jq -r --arg id "$id" '.policies.ExtensionSettings[$id].install_url // empty' <<<"$wolf_existing")"
-        if [[ -z "$url" && "$mode" == apply ]]; then
-            temporary="$(mktemp "${TMPDIR:-/tmp}/browser-extension-update.XXXXXX")"
-            curl --fail --silent --show-error --location --retry 2 --connect-timeout 15 --max-time 120 \
-                --proto '=https' --proto-redir '=https' --output "$temporary" "$update_manifest"
-            update_data="$(jq -e --arg id "$id" '.addons[$id].updates | select(type == "array" and length > 0) | last
-                | select((.version | type == "string") and (.update_link | type == "string"))' "$temporary")"
-            url="$(jq -r '.update_link' <<<"$update_data")"
-            rm -f -- "$temporary"
-            temporary=""
+        url="$(jq -r --arg id "$id" '.policies.ExtensionSettings[$id].install_url // empty' <<<"$wolf_current")"
+        if [[ "$url" =~ ^https://gitflic\.ru/project/magnolia1234/bpc_uploads/blob/raw\?file=bypass_paywalls_clean-[0-9]+(\.[0-9]+)*\.xpi$ ]]; then
+            wolf_current="$(jq --arg id "$id" --arg url "$bpc_latest" '
+                .policies.ExtensionSettings[$id].install_url = $url' <<<"$wolf_current")"
+            url="$bpc_latest"
         fi
-        [[ "$url" =~ ^https://gitflic\.ru/project/magnolia1234/bpc_uploads/blob/raw\?file=bypass_paywalls_clean-[0-9]+(\.[0-9]+)*\.xpi$ ]] || {
-            printf 'Browser extensions: missing or conflicting Bypass Paywalls Clean download URL; existing policies preserved.\n' >&2
+        [[ -z "$url" || "$url" == "$bpc_latest" ]] || {
+            printf 'Browser extensions: conflicting Bypass Paywalls Clean download URL; existing policies preserved.\n' >&2
             exit 1
         }
-        wolf_desired="$(jq -c --arg id "$id" --arg url "$url" '
+        wolf_desired="$(jq -c --arg id "$id" --arg url "$bpc_latest" '
             .[$id] |= (del(.update_manifest_url) + {install_url: $url})' <<<"$wolf_desired")"
-    done < <(jq -r '.librewolf.ExtensionSettings | to_entries[]
-        | select(.value.update_manifest_url) | [.key, .value.update_manifest_url] | @tsv' <<<"$config")
+    done < <(jq -r '.librewolf.ExtensionSettings | to_entries[] | select(.value.update_manifest_url) | .key' <<<"$config")
 
     # Preserve unrelated keys and reject conflicting local fields, never reset them.
     local merge='def merge_settings($wanted):
@@ -163,13 +163,13 @@ configure_browser_extension_policies() (
         then error("a requested extension has a conflicting legacy removal/lock policy") else . end
         | . as $existing | $base * $existing
         | .policies.ExtensionSettings = ((.policies.ExtensionSettings // {}) | merge_settings($wanted))
-    ' <<<"$wolf_existing")"
+    ' <<<"$wolf_current")"
     helium_output="$(jq --argjson wanted "$helium_desired" "$merge"'
         .ExtensionSettings = ((.ExtensionSettings // {}) | merge_settings($wanted))
     ' <<<"$helium_base")"
 
     if [[ "$mode" == check ]]; then
-        # Validation is entirely local and does not fetch newer update manifests.
+        # Validation is entirely local; a leftover versioned BPC link fails it.
         jq -e --argjson expected "$wolf_output" '. == $expected' <<<"$wolf_existing" >/dev/null
         jq -e --argjson expected "$helium_output" '. == $expected' <<<"$helium_base" >/dev/null
         exit 0
