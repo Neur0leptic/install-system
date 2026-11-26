@@ -71,16 +71,16 @@ Btrfs the menu also lists the snapshots; the first one is the finished installat
   use, the list is `/etc/portage/savedconfig/sys-kernel/linux-firmware`. Add files to
   it when you add hardware.
 
-## Private dotfiles and VPN
-
-The private dotfiles belong to the author's `neuroleptic` account, which gets them
-unless `--no-private-dotfiles` is given. They need a GitHub SSH key (the installer
-creates one and waits until you add it to GitHub) and the GPG key that encrypts them
-(the installer stops until you restore it). Other accounts need neither.
+## VPN
 
 In the full tier, the installer can register the computer with your Mullvad account
-for WireGuard. The account number is used once and never stored, so a continued
-installation asks for it again.
+for WireGuard, or leave the VPN out. The account number is used once and never
+stored, so a continued installation asks for it again.
+
+## My private dotfiles
+
+My own `neuroleptic` account gets my private dotfiles, unless
+`--no-private-dotfiles` is given. Other accounts do not get them.
 
 ## Related repositories
 
